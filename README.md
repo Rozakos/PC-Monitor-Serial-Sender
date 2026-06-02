@@ -166,11 +166,36 @@ CPU=423;RAM=587;GPU=120;DL=45;UL=12;RAMU=9381;RAMT=16384;VRAM=512;VRAMT=2048;TEM
 
 ## Settings & persistence
 
-Settings are saved to `~/.pcmonitor_sender.json`, including the selected port,
-baud rate, page selection/order, page delay, LCD type map, and the
-LibreHardwareMonitor DLL path. Start-on-boot is implemented as a Windows logon
-Scheduled Task named `RozakosPCMonitorSender` that runs with highest privileges
-so the elevated app launches silently and minimized to tray.
+Settings are saved to `~/.pcmonitor_sender.json` (written atomically so a crash
+mid-save can't corrupt it), including the selected port, baud rate, page
+selection/order, page delay, LCD type map, and the LibreHardwareMonitor DLL
+path. Start-on-boot is implemented as a Windows logon Scheduled Task named
+`RozakosPCMonitorSender` that runs with highest privileges so the elevated app
+launches silently and minimized to tray.
+
+### Data folder
+
+Downloaded DLLs and logs live under a per-user data folder:
+
+```
+%LOCALAPPDATA%\RozakosPCMonitor\
+    LibreHardwareMonitor\      ← LibreHardwareMonitorLib.dll + deps
+    crash.log                  ← uncaught errors (this is a windowed app)
+```
+
+This is created automatically on first run. It's used instead of writing next
+to the EXE, so the app works the same whether the EXE lives in `Program Files`,
+your Downloads folder, or anywhere else — and never needs write access there.
+If a `LibreHardwareMonitor\` folder already sits next to the EXE (legacy
+installs), that DLL is preferred for backward compatibility.
+
+### Single instance
+
+Only one copy runs at a time. Launching again (or double-clicking while it's
+minimized in the tray) detects the running instance via a named mutex, shows a
+brief notice, and exits instead of starting a second copy that would fight over
+the serial port. The guard hands the mutex off correctly across the UAC
+elevation relaunch.
 
 ---
 

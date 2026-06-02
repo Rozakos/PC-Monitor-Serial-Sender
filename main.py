@@ -79,6 +79,102 @@ BRAND_ICO = os.path.join(_BUNDLE_DIR, "icon.ico")
 if not os.path.isfile(BRAND_ICO):
     BRAND_ICO = os.path.join(_APP_DIR, "icon.ico")
 
+# ── Per-user data directory ──────────────────────────────────────────────────
+# A writable, persistent home for downloaded DLLs and logs. Unlike _APP_DIR
+# (next to the EXE) this works no matter where the EXE lives -- including
+# read-only spots like Program Files or a transient Downloads folder -- and
+# needs no admin rights. This is the standard Windows location for app data.
+_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "RozakosPCMonitor")
+_LHM_DIR = os.path.join(_DATA_DIR, "LibreHardwareMonitor")
+_DEFAULT_LHM_DLL = os.path.join(_LHM_DIR, "LibreHardwareMonitorLib.dll")
+
+def _ensure_data_dir():
+    """Create the per-user data / LHM folders if they don't exist (best-effort)."""
+    try:
+        os.makedirs(_LHM_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+def _default_dll_path():
+    """Resolve the default LHM DLL path, preferring an existing install.
+
+    Order: a DLL already sitting next to the EXE (legacy installs) -> the
+    per-user data folder default. No hardcoded drive paths.
+    """
+    legacy = os.path.join(_APP_DIR, "LibreHardwareMonitor",
+                          "LibreHardwareMonitorLib.dll")
+    if os.path.isfile(legacy):
+        return legacy
+    return _DEFAULT_LHM_DLL
+
+# ── Single-instance guard ────────────────────────────────────────────────────
+# Without this, double-clicking the EXE (or launching while it's minimized in
+# the tray) starts a second copy that fights the first for the serial port and
+# adds a duplicate tray icon. A named mutex, held for the process lifetime,
+# lets later launches detect the running copy. Bare name -> per-session
+# namespace, so it works across UAC elevation within the same login session.
+_INSTANCE_MUTEX_NAME = "RozakosPCMonitorSender_singleton"
+_instance_mutex_handle = None
+
+def _acquire_single_instance():
+    """True if we're the only instance; False if another already holds the mutex."""
+    global _instance_mutex_handle
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        handle = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+        if not handle:
+            return True  # couldn't create the mutex -> don't block startup
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        _instance_mutex_handle = handle
+        return True
+    except Exception:
+        return True
+
+def _release_single_instance():
+    """Release the mutex so a relaunched (e.g. elevated) instance can take it."""
+    global _instance_mutex_handle
+    try:
+        if _instance_mutex_handle:
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(_instance_mutex_handle)
+    except Exception:
+        pass
+    _instance_mutex_handle = None
+
+def _warn_already_running():
+    """Tell the user the app is already running (no Tk root needed)."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "PC Monitor Sender is already running.\n\n"
+            "Look for its icon in the system tray (bottom-right, near the clock).",
+            "PC Monitor Sender",
+            0x40)  # MB_ICONINFORMATION
+    except Exception:
+        pass
+
+def _install_crash_logger():
+    """Log uncaught exceptions to a file -- this is a windowed (no-console) app,
+    so otherwise a crash would vanish with no trace."""
+    import traceback, datetime
+    log_path = os.path.join(_DATA_DIR, "crash.log")
+    def _hook(exc_type, exc, tb):
+        try:
+            _ensure_data_dir()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+                traceback.print_exception(exc_type, exc, tb, file=f)
+        except Exception:
+            pass
+    _sys.excepthook = _hook
+
 try:
     import serial;  SERIAL_OK = True
 except ImportError:
@@ -227,10 +323,18 @@ def load_settings():
         return {}
 
 def save_settings(d):
-    """Persist the settings dict. Returns True on success."""
+    """Persist the settings dict atomically. Returns True on success.
+
+    Writes to a temp file then os.replace()s it into place, so a crash or power
+    loss mid-write can never leave a half-written (corrupt) settings file.
+    """
     try:
-        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        tmp = _SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             _json.dump(d, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _SETTINGS_PATH)
         return True
     except Exception:
         return False
@@ -319,7 +423,7 @@ def _ensure_lhm_deps(dll_path, log_fn=print):
         ("System.Security.Principal.Windows", "5.0.0"),
     ]
     nuget_dir = os.path.join(
-        os.path.dirname(dll_path) or os.path.join(_APP_DIR, "LibreHardwareMonitor"),
+        os.path.dirname(dll_path) or _LHM_DIR,
         "nuget")
     nuget_dll = os.path.join(nuget_dir, "LibreHardwareMonitorLib.dll")
 
@@ -388,7 +492,7 @@ def _ensure_lhm_deps(dll_path, log_fn=print):
     if os.path.isfile(dll_path):
         return dll_path
 
-    dll_dir = os.path.dirname(dll_path) or os.path.join(_APP_DIR, "LibreHardwareMonitor")
+    dll_dir = os.path.dirname(dll_path) or _LHM_DIR
     dll_name = "LibreHardwareMonitorLib.dll"
     target = os.path.join(dll_dir, dll_name)
 
@@ -1233,6 +1337,9 @@ class App(tk.Tk):
             if self._start_minimized:
                 # Boot launch: begin monitoring once the port scan has run.
                 self.after(1200, self._autostart_monitor)
+            else:
+                # First-run convenience: offer to fetch LHM if it's missing.
+                self.after(700, self._maybe_prompt_lhm_download)
 
         splash.after(50, _step)
 
@@ -1426,12 +1533,7 @@ class App(tk.Tk):
         lbl("LHM DLL", row)
         df = tk.Frame(f, bg=BG2); df.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
         df.columnconfigure(0, weight=1)
-        _local_dll = os.path.join(
-            _APP_DIR,
-            "LibreHardwareMonitor", "LibreHardwareMonitorLib.dll")
-        _default_dll = (_local_dll if os.path.isfile(_local_dll)
-                        else r"C:\TOOLS\LibreHardwareMonitor\LibreHardwareMonitorLib.dll")
-        self._lhm_var = tk.StringVar(value=_default_dll)
+        self._lhm_var = tk.StringVar(value=_default_dll_path())
         tk.Entry(df, textvariable=self._lhm_var, bg=BG3, fg=TEXT, insertbackground=TEXT,
                  relief="flat", font=("Consolas",8), highlightbackground=BORDER,
                  highlightthickness=1).grid(row=0, column=0, sticky="ew")
@@ -1469,8 +1571,8 @@ class App(tk.Tk):
 
         tk.Label(dl_frame, text="Folder:", bg=BG3, fg=TEXT_DIM,
                  font=("Segoe UI",8)).grid(row=1, column=0, sticky="w", pady=(6,2))
-        self._lhm_dest_var = tk.StringVar(value=os.path.join(
-            _APP_DIR, "LibreHardwareMonitor"))
+        self._lhm_dest_var = tk.StringVar(
+            value=os.path.dirname(_default_dll_path()))
         dest_row = tk.Frame(dl_frame, bg=BG3)
         dest_row.grid(row=1, column=1, sticky="ew", pady=(6,2), padx=(4,0))
         dest_row.columnconfigure(0, weight=1)
@@ -1860,6 +1962,32 @@ class App(tk.Tk):
             if bg: self._dl_btn.config(bg=bg)
         self.after(0, _update)
 
+    def _maybe_prompt_lhm_download(self):
+        """On first run, if the LHM DLL is missing, offer to download it to the
+        default folder. Skipped when booting to tray or if previously dismissed."""
+        if self._start_minimized:
+            return
+        if getattr(self, "_lhm_prompt_dismissed", False):
+            return
+        path = self._lhm_var.get().strip()
+        if path and os.path.isfile(path):
+            return
+        dest = self._lhm_dest_var.get().strip() or _LHM_DIR
+        from tkinter import messagebox
+        ans = messagebox.askyesno(
+            "Enable temperatures?",
+            "CPU/GPU temperatures need LibreHardwareMonitor, which isn't "
+            "installed yet.\n\n"
+            f"Download it now to:\n{dest}\n\n"
+            "(You can always do this later from the Settings tab.)",
+            parent=self)
+        if ans:
+            self._start_lhm_download()
+        else:
+            # Remember the choice so we don't nag on every launch.
+            self._lhm_prompt_dismissed = True
+            self._save_settings()
+
     def _start_lhm_download(self):
         self._dl_btn.config(state="disabled", text="Downloading...")
         self._dl_progress.config(value=0)
@@ -2186,6 +2314,7 @@ class App(tk.Tk):
             "page_delay": self._delay_var.get(),
             "page_order": [[pid, bool(v.get())] for pid, _, v in self._page_order],
             "lcd_types":  dict(self._lcd_types),
+            "lhm_prompt_dismissed": getattr(self, "_lhm_prompt_dismissed", False),
         }
 
     def _save_settings(self):
@@ -2209,6 +2338,7 @@ class App(tk.Tk):
                 self._lhm_var.set(d["lhm_path"])
             if d.get("lhm_dest"):
                 self._lhm_dest_var.set(d["lhm_dest"])
+            self._lhm_prompt_dismissed = bool(d.get("lhm_prompt_dismissed", False))
             if "page_delay" in d:
                 self._delay_var.set(int(d["page_delay"]))
                 self._dlbl.config(text=f"{self._delay_var.get()/1000:.1f} s")
@@ -2267,6 +2397,28 @@ class App(tk.Tk):
                 self._append_log(
                     "[INFO] Administrator rights are required to change "
                     "start-on-boot.")
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk routes widget-callback errors here. Without an override they'd be
+        printed to stderr -- which is a null sink in this windowed app -- and
+        silently lost. Surface them in the log and persist to crash.log."""
+        import traceback, datetime
+        try:
+            msg = "".join(traceback.format_exception(exc, val, tb))
+        except Exception:
+            msg = f"{exc}: {val}"
+        try:
+            self._append_log("[ERROR] Unexpected GUI error:\n" + msg)
+        except Exception:
+            pass
+        try:
+            _ensure_data_dir()
+            with open(os.path.join(_DATA_DIR, "crash.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
+                        "(GUI callback) =====\n")
+                f.write(msg)
+        except Exception:
+            pass
 
     def _on_close(self):
         """Minimise to tray instead of quitting."""
@@ -2398,9 +2550,23 @@ if __name__ == "__main__":
     # If not elevated, relaunch via UAC and exit this unelevated instance.
     # The sentinel guarantees we attempt this at most once -- if the elevated
     # instance still isn't detected as admin, we run anyway instead of looping.
+    _ensure_data_dir()
+    _install_crash_logger()
+
+    # Single-instance: bail out early if another copy is already running, so we
+    # don't fight over the serial port or stack up tray icons.
+    if not _acquire_single_instance():
+        _warn_already_running()
+        _sys.exit(0)
+
     _already_relaunched = _ELEVATED_FLAG in _sys.argv
     if not _is_admin() and not _already_relaunched:
+        # Release the mutex first so the elevated instance can take it cleanly,
+        # then relaunch via UAC.
+        _release_single_instance()
         if _relaunch_as_admin():
             _sys.exit(0)
-        # Elevation declined or failed -- continue unelevated; temps will show N/A.
+        # Elevation declined or failed -- continue unelevated (temps show N/A);
+        # re-take the mutex so we still hold single-instance while running.
+        _acquire_single_instance()
     App().mainloop()
