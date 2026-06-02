@@ -31,12 +31,14 @@ $python = if (Test-Path '.\.venv\Scripts\python.exe') {
 }
 Write-Host "Using Python: $python" -ForegroundColor Cyan
 
-# Make sure PyInstaller is available.
-& $python -m PyInstaller --version *> $null
-if (-not $?) {
+# Make sure PyInstaller is available. (Probe via pip so a missing module
+# doesn't throw under ErrorActionPreference='Stop'; avoid redirecting native
+# stderr, which PowerShell 5.1 would wrap into a terminating error.)
+& $python -m pip show pyinstaller | Out-Null
+if ($LASTEXITCODE -ne 0) {
     Write-Host 'PyInstaller not found - installing...' -ForegroundColor Yellow
     & $python -m pip install pyinstaller
-    if (-not $?) { throw 'Failed to install PyInstaller.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to install PyInstaller.' }
 }
 
 if ($Clean) {
@@ -46,7 +48,7 @@ if ($Clean) {
 
 Write-Host 'Building EXE from PC-Monitor-Sender.spec ...' -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm 'PC-Monitor-Sender.spec'
-if (-not $?) { throw 'PyInstaller build failed.' }
+if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed.' }
 
 $exe = Join-Path $PSScriptRoot 'dist\PC-Monitor-Sender.exe'
 if (Test-Path $exe) {

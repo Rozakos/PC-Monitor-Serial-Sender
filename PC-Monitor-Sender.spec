@@ -3,9 +3,9 @@
 PyInstaller spec for PC Monitor Serial Sender.
 
 Build with:   pyinstaller PC-Monitor-Sender.spec
-or just run:  .\build.ps1
+or just run:  build.ps1
 
-Produces a single windowed EXE in dist\. The app downloads
+Produces a single windowed EXE in the dist folder. The app downloads
 LibreHardwareMonitor at runtime, so nothing extra needs bundling.
 """
 
