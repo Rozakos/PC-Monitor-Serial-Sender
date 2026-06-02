@@ -1,0 +1,22 @@
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# App-downloaded native deps
+LibreHardwareMonitor/
+*.dll
+
+# Local settings
+.pcmonitor_sender.json

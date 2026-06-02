@@ -1,0 +1,2399 @@
+# -*- coding: utf-8 -*-
+"""
+PC Monitor Sender -- Tkinter GUI  v3
+Mixed 1602/2004 LCD support, runtime-configured. Standalone EXE compatible.
+"""
+
+import time
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext
+import queue, os, subprocess, re, zipfile, io
+import urllib.request, urllib.error, json as _json
+
+# Suppress the console window Windows pops when this GUI process (pythonw, no
+# console) shells out to console tools (typeperf, nvidia-smi, wmic, dotnet, ...).
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_OK = True
+except ImportError:
+    TRAY_OK = False
+
+# pythonnet 3.x: select runtime BEFORE any 'import clr'
+# LHM v0.9.6 targets .NET 9, so we need coreclr (not netfx)
+_pn_runtime = "none"
+try:
+    from pythonnet import load as _pn_load
+    try:
+        _pn_load("coreclr")
+        _pn_runtime = "coreclr"
+    except Exception:
+        try:
+            _pn_load("netfx")
+            _pn_runtime = "netfx"
+        except Exception:
+            _pn_runtime = "default"
+except ImportError:
+    _pn_runtime = "not_installed"
+
+# Rozakos Industries branding
+APP_VERSION   = "1.0.0"
+BRAND_NAME    = "Rozakos Industries"
+BRAND_URL     = "https://rozakos.com"
+BRAND_EMAIL   = "info@rozakos.com"
+# Robot logo as embedded base64 PNG (used for tray + about)
+_FULL_LOGO_B64 = "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"
+_ROBOT_B64    = "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"
+
+try:
+    import psutil;  PSUTIL_OK = True
+except ImportError:
+    PSUTIL_OK = False
+
+# ── Resolve the directory where the script / EXE lives ───────────────────────
+# sys.frozen is set by PyInstaller; __file__ doesn't exist in that context.
+import sys as _sys
+# Under pythonw.exe (no console) stdout/stderr are None, which makes any
+# print() raise. Redirect them to a dummy sink so logging stays harmless.
+if _sys.stdout is None or _sys.stderr is None:
+    class _NullWriter:
+        def write(self, *a, **k): pass
+        def flush(self, *a, **k): pass
+    if _sys.stdout is None: _sys.stdout = _NullWriter()
+    if _sys.stderr is None: _sys.stderr = _NullWriter()
+
+if getattr(_sys, 'frozen', False):
+    _APP_DIR = os.path.dirname(_sys.executable)
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+BRAND_ICO = os.path.join(_APP_DIR, "icon.ico")
+
+try:
+    import serial;  SERIAL_OK = True
+except ImportError:
+    SERIAL_OK = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PALETTE
+# ══════════════════════════════════════════════════════════════════════════════
+BG       = "#1a1b26"
+BG2      = "#24253a"
+BG3      = "#2e2f4a"
+ACCENT   = "#7aa2f7"
+ACCENT2  = "#bb9af7"
+GREEN    = "#9ece6a"
+YELLOW   = "#e0af68"
+RED      = "#f7768e"
+TEXT     = "#c0caf5"
+TEXT_DIM = "#565f89"
+BORDER   = "#3b3d5c"
+LCD_BG   = "#0a1a0a"
+LCD_ON   = "#33ff55"
+LCD_DIM  = "#1a3320"
+LCD_FRAME= "#0d260d"
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKEND (sensors / serial helpers)
+# ══════════════════════════════════════════════════════════════════════════════
+_lhm_computer   = None
+_lhm_available  = False
+_lhm_init_tried = False
+_vram_failures  = 0
+_VRAM_MAX_FAIL  = 3
+
+def _is_admin():
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+# Sentinel passed to the elevated relaunch so we NEVER relaunch more than once
+# (prevents an infinite spawn loop if elevation can't be detected afterwards).
+_ELEVATED_FLAG = "--pcmon-elevated"
+
+def _relaunch_as_admin():
+    """Relaunch the current process elevated via UAC. Returns True if a relaunch
+    was triggered (caller should exit), False if already admin or relaunch failed."""
+    if _is_admin():
+        return False
+    try:
+        import ctypes
+        # Forward existing args (minus our own sentinel) plus the sentinel.
+        fwd = [a for a in _sys.argv[1:] if a != _ELEVATED_FLAG]
+        if getattr(_sys, 'frozen', False):
+            # Standalone EXE: re-run the EXE itself
+            exe = _sys.executable
+            params = subprocess.list2cmdline(fwd + [_ELEVATED_FLAG])
+        else:
+            # Script: re-run with pythonw.exe (no console window) when available
+            exe = _sys.executable
+            pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.isfile(pyw):
+                exe = pyw
+            params = subprocess.list2cmdline(
+                [os.path.abspath(__file__)] + fwd + [_ELEVATED_FLAG])
+        # ShellExecuteW with "runas" triggers the UAC elevation prompt.
+        # Returns >32 on success.
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", exe, params, _APP_DIR, 1)
+        return rc > 32
+    except Exception:
+        return False
+
+# ── Start-on-boot via a logon Scheduled Task ─────────────────────────────────
+# A scheduled task (rather than an HKCU\...\Run entry) is used on purpose: this
+# app self-elevates via UAC, so a plain Run entry would pop a UAC prompt at
+# every login. A task created with "Run with highest privileges" launches the
+# app already-elevated and silently, so there's no prompt on boot.
+_STARTUP_TASK_NAME = "RozakosPCMonitorSender"
+# Flag forwarded by the boot launch so the app goes straight to the tray.
+_MINIMIZED_FLAG = "--start-minimized"
+
+def _startup_launch_cmd():
+    """The command line the logon task should run (elevated + minimized)."""
+    if getattr(_sys, 'frozen', False):
+        exe = _sys.executable
+        return f'"{exe}" {_ELEVATED_FLAG} {_MINIMIZED_FLAG}'
+    exe = _sys.executable
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.isfile(pyw):
+        exe = pyw
+    return f'"{exe}" "{os.path.abspath(__file__)}" {_ELEVATED_FLAG} {_MINIMIZED_FLAG}'
+
+def _startup_enabled():
+    """True if the logon scheduled task already exists."""
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", _STARTUP_TASK_NAME],
+            capture_output=True, text=True, creationflags=_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _enable_startup():
+    """Create the logon task. Returns (ok, message)."""
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Create", "/TN", _STARTUP_TASK_NAME,
+             "/TR", _startup_launch_cmd(), "/SC", "ONLOGON",
+             "/RL", "HIGHEST", "/F"],
+            capture_output=True, text=True, creationflags=_NO_WINDOW)
+        if r.returncode == 0:
+            return True, "[OK]   Start-on-boot enabled (launches minimized to tray)."
+        err = (r.stderr or r.stdout).strip()
+        return False, f"[WARN] Could not enable start-on-boot: {err}"
+    except Exception as e:
+        return False, f"[WARN] Could not enable start-on-boot: {e}"
+
+def _disable_startup():
+    """Remove the logon task. Returns (ok, message)."""
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Delete", "/TN", _STARTUP_TASK_NAME, "/F"],
+            capture_output=True, text=True, creationflags=_NO_WINDOW)
+        if r.returncode == 0:
+            return True, "[OK]   Start-on-boot disabled."
+        err = (r.stderr or r.stdout).strip()
+        return False, f"[WARN] Could not disable start-on-boot: {err}"
+    except Exception as e:
+        return False, f"[WARN] Could not disable start-on-boot: {e}"
+
+# ── Settings persistence ─────────────────────────────────────────────────────
+# Stored in the user profile (not _APP_DIR) so it works no matter where the EXE
+# lives and whether the app is running elevated.
+_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".pcmonitor_sender.json")
+
+def load_settings():
+    """Read the saved settings dict; return {} if none / unreadable."""
+    try:
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            d = _json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def save_settings(d):
+    """Persist the settings dict. Returns True on success."""
+    try:
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+def _ensure_lhm_deps(dll_path, log_fn=print):
+    """Auto-install pythonnet and auto-download LHM DLL if needed."""
+
+    # ── Step 1: ensure pythonnet ──────────────────────────────────────────
+    try:
+        import clr  # noqa: F401
+        log_fn("[INFO] pythonnet already installed")
+    except ImportError:
+        log_fn("[INFO] pythonnet not found -- installing via pip...")
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                [_sys.executable, "-m", "pip", "install", "pythonnet"],
+                capture_output=True, text=True, timeout=120,
+                creationflags=_NO_WINDOW)
+            if result.returncode == 0:
+                log_fn("[OK]   pythonnet installed successfully")
+            else:
+                log_fn(f"[WARN] pip install pythonnet failed: {result.stderr.strip()}")
+                return dll_path
+        except Exception as e:
+            log_fn(f"[WARN] Could not install pythonnet: {e}")
+            return dll_path
+
+    # ── Step 1b: ensure .NET 9 Desktop Runtime ────────────────────────────
+    try:
+        result = subprocess.run(
+            ["dotnet", "--list-runtimes"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW)
+        runtimes = result.stdout if result.returncode == 0 else ""
+        has_net9 = any("Microsoft.WindowsDesktop.App 9." in line for line in runtimes.splitlines())
+
+        if has_net9:
+            log_fn("[INFO] .NET 9 Desktop Runtime found")
+        else:
+            desktop_rts = [l.strip() for l in runtimes.splitlines() if "WindowsDesktop" in l]
+            if desktop_rts:
+                log_fn(f"[INFO] Installed runtimes: {'; '.join(desktop_rts)}")
+            log_fn("[INFO] .NET 9 Desktop Runtime not found -- installing via winget...")
+            res = subprocess.run(
+                ["winget", "install", "Microsoft.DotNet.DesktopRuntime.9",
+                 "--accept-source-agreements", "--accept-package-agreements"],
+                capture_output=True, text=True, timeout=300,
+                creationflags=_NO_WINDOW)
+            if res.returncode == 0:
+                log_fn("[OK]   .NET 9 Desktop Runtime installed successfully")
+                log_fn("[INFO] Restart the app for .NET 9 to take effect.")
+            else:
+                log_fn(f"[WARN] winget failed: {res.stderr.strip()[:120]}")
+                log_fn("[INFO] Trying PowerShell dotnet-install script...")
+                ps_cmd = (
+                    'powershell -NoProfile -ExecutionPolicy Bypass -Command "'
+                    '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; '
+                    "Invoke-WebRequest 'https://dot.net/v1/dotnet-install.ps1' -OutFile dotnet-install.ps1; "
+                    ".\\dotnet-install.ps1 -Runtime windowsdesktop -Channel 9.0 "
+                    "-InstallDir 'C:\\Program Files\\dotnet'" + '"'
+                )
+                res2 = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True, timeout=300,
+                                      creationflags=_NO_WINDOW)
+                if res2.returncode == 0:
+                    log_fn("[OK]   .NET 9 Desktop Runtime installed via PowerShell")
+                    log_fn("[INFO] Restart the app for .NET 9 to take effect.")
+                else:
+                    log_fn("[WARN] Auto-install failed. Please install manually:")
+                    log_fn("[WARN] https://dotnet.microsoft.com/download/dotnet/9.0")
+                    log_fn("[WARN] Download '.NET Desktop Runtime 9.0' (x64 installer)")
+    except FileNotFoundError:
+        log_fn("[WARN] 'dotnet' not found -- please install .NET 9 Desktop Runtime:")
+        log_fn("[WARN] https://dotnet.microsoft.com/download/dotnet/9.0")
+    except Exception as e:
+        log_fn(f"[WARN] .NET runtime check failed: {e}")
+
+    # ── Step 1c: download LHM from NuGet (v0.9.4, netstandard2.0) ────────
+    # GitHub v0.9.6 targets .NET 10 preview; NuGet v0.9.4 works with .NET 8/9
+    _NUGET_LHM_PKG = "LibreHardwareMonitorLib"
+    _NUGET_LHM_VER = "0.9.4"
+    _NUGET_DEPS = [
+        ("System.Threading.AccessControl", "8.0.0"),
+        ("System.IO.FileSystem.AccessControl", "5.0.0"),
+        ("System.Security.AccessControl", "6.0.1"),
+        ("System.Security.Principal.Windows", "5.0.0"),
+    ]
+    nuget_dir = os.path.join(
+        os.path.dirname(dll_path) or os.path.join(_APP_DIR, "LibreHardwareMonitor"),
+        "nuget")
+    nuget_dll = os.path.join(nuget_dir, "LibreHardwareMonitorLib.dll")
+
+    def _download_nupkg(pkg_name, pkg_ver, dest_dir, log_fn):
+        """Download a NuGet package and extract DLLs from it."""
+        import ssl
+        ctx = ssl.create_default_context()
+        url = (f"https://api.nuget.org/v3-flatcontainer/"
+               f"{pkg_name.lower()}/{pkg_ver}/{pkg_name.lower()}.{pkg_ver}.nupkg")
+        req = urllib.request.Request(url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            data = resp.read()
+        os.makedirs(dest_dir, exist_ok=True)
+        extracted = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for preferred in ["lib/net8.0/", "lib/net6.0/", "lib/netstandard2.0/", "lib/"]:
+                for m in zf.namelist():
+                    if m.lower().startswith(preferred.lower()) and m.lower().endswith(".dll"):
+                        fname = os.path.basename(m)
+                        out = os.path.join(dest_dir, fname)
+                        with open(out, "wb") as f:
+                            f.write(zf.read(m))
+                        extracted.append(fname)
+                if extracted:
+                    break
+            if not extracted:
+                # Fallback: any DLL matching the package name
+                for m in zf.namelist():
+                    if m.lower().endswith(f"{pkg_name.lower()}.dll"):
+                        fname = os.path.basename(m)
+                        out = os.path.join(dest_dir, fname)
+                        with open(out, "wb") as f:
+                            f.write(zf.read(m))
+                        extracted.append(fname)
+                        break
+        return extracted
+
+    # Download LHM NuGet package if not present
+    if not os.path.isfile(nuget_dll):
+        log_fn(f"[INFO] Downloading NuGet: {_NUGET_LHM_PKG} v{_NUGET_LHM_VER}...")
+        try:
+            files = _download_nupkg(_NUGET_LHM_PKG, _NUGET_LHM_VER, nuget_dir, log_fn)
+            if files:
+                log_fn(f"[OK]   NuGet LHM extracted: {', '.join(files)}")
+            else:
+                log_fn("[WARN] No DLLs found in NuGet package")
+        except Exception as e:
+            log_fn(f"[WARN] NuGet LHM download failed: {e}")
+
+    # Download dependency DLLs
+    for pkg_name, pkg_ver in _NUGET_DEPS:
+        dep_dll = os.path.join(nuget_dir, f"{pkg_name}.dll")
+        if os.path.isfile(dep_dll):
+            continue
+        log_fn(f"[INFO] Downloading NuGet dep: {pkg_name} v{pkg_ver}...")
+        try:
+            files = _download_nupkg(pkg_name, pkg_ver, nuget_dir, log_fn)
+            if files:
+                log_fn(f"[OK]   Extracted {', '.join(files)}")
+            else:
+                log_fn(f"[WARN] {pkg_name}.dll not found in NuGet package")
+        except Exception as e:
+            log_fn(f"[WARN] NuGet download failed for {pkg_name}: {e}")
+
+    # ── Step 2: ensure DLL exists ─────────────────────────────────────────
+    if os.path.isfile(dll_path):
+        return dll_path
+
+    dll_dir = os.path.dirname(dll_path) or os.path.join(_APP_DIR, "LibreHardwareMonitor")
+    dll_name = "LibreHardwareMonitorLib.dll"
+    target = os.path.join(dll_dir, dll_name)
+
+    log_fn(f"[INFO] LHM DLL not found at: {dll_path}")
+    log_fn("[INFO] Auto-downloading LibreHardwareMonitor from GitHub...")
+
+    try:
+        import ssl
+        import json as _json
+
+        ctx = ssl.create_default_context()
+        api_url = "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            release = _json.loads(resp.read().decode())
+
+        tag = release.get("tag_name", "?")
+        zip_url = None
+        for a in release.get("assets", []):
+            name = a.get("name", "").lower()
+            if name.endswith(".zip") and "libre" in name:
+                zip_url = a["browser_download_url"]; break
+        if not zip_url:
+            for a in release.get("assets", []):
+                if a.get("name", "").lower().endswith(".zip"):
+                    zip_url = a["browser_download_url"]; break
+
+        if not zip_url:
+            log_fn(f"[WARN] No zip asset found in release {tag}")
+            return dll_path
+
+        log_fn(f"[INFO] Downloading {tag}...")
+        req2 = urllib.request.Request(zip_url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+        with urllib.request.urlopen(req2, context=ctx, timeout=120) as resp:
+            data = resp.read()
+        log_fn(f"[INFO] Downloaded {len(data)//1024} KB -- extracting DLL...")
+
+        os.makedirs(dll_dir, exist_ok=True)
+        buf = io.BytesIO(data)
+        found = False
+        with zipfile.ZipFile(buf) as zf:
+            for member in zf.namelist():
+                if member.lower().endswith(dll_name.lower()):
+                    with open(target, "wb") as fout:
+                        fout.write(zf.read(member))
+                    found = True
+                    log_fn(f"[OK]   Extracted {dll_name} to {dll_dir}")
+                    break
+                # Also extract HidSharp.dll if present (needed by some LHM versions)
+            for member in zf.namelist():
+                bname = os.path.basename(member).lower()
+                if bname.endswith(".dll") and bname != dll_name.lower():
+                    dep_path = os.path.join(dll_dir, os.path.basename(member))
+                    if not os.path.isfile(dep_path):
+                        with open(dep_path, "wb") as fout:
+                            fout.write(zf.read(member))
+
+        if not found:
+            log_fn("[WARN] DLL not found in zip archive")
+            return dll_path
+
+        return target
+
+    except Exception as e:
+        log_fn(f"[WARN] Auto-download failed: {e}")
+        return dll_path
+
+
+def _init_lhm(dll_path, log_fn=print):
+    global _lhm_computer, _lhm_available, _lhm_init_tried
+    _lhm_init_tried = True
+
+    # Prefer NuGet v0.9.4 subfolder over GitHub v0.9.6
+    dll_dir_base = os.path.dirname(os.path.abspath(dll_path))
+    nuget_dir = os.path.join(dll_dir_base, "nuget")
+    nuget_dll = os.path.join(nuget_dir, "LibreHardwareMonitorLib.dll")
+
+    if os.path.isfile(nuget_dll):
+        use_dir = nuget_dir
+        use_dll = nuget_dll
+        log_fn("[TEMP] Using NuGet LHM v0.9.4 (recommended)")
+    elif os.path.isfile(dll_path):
+        use_dir = dll_dir_base
+        use_dll = os.path.abspath(dll_path)
+        log_fn("[TEMP] Using GitHub LHM (NuGet not available)")
+    else:
+        log_fn(f"[TEMP] DLL not found: {dll_path}"); return False
+
+    if not _is_admin():
+        log_fn("[TEMP] WARNING: Not running as Administrator!")
+        log_fn("[TEMP] LHM requires admin rights to read hardware sensors.")
+        log_fn("[TEMP] Right-click the script/EXE and choose 'Run as administrator'.")
+        log_fn("[TEMP] Temperatures will show N/A until relaunched as admin.")
+    try:
+        import sys as _sys
+        import clr
+
+        dll_name = os.path.splitext(os.path.basename(use_dll))[0]
+
+        log_fn(f"[TEMP] pythonnet runtime: {_pn_runtime}")
+        log_fn(f"[TEMP] DLL dir: {use_dir}")
+        # List DLL files in the folder for diagnostics
+        try:
+            dlls_in_dir = [f for f in os.listdir(use_dir) if f.lower().endswith('.dll')]
+            log_fn(f"[TEMP] DLLs in folder: {', '.join(sorted(dlls_in_dir))}")
+        except Exception:
+            pass
+
+        # Ensure DLL directory is on sys.path
+        if use_dir not in _sys.path:
+            _sys.path.insert(0, use_dir)
+
+        # Pre-load dependency DLLs (critical for NuGet approach)
+        _DEP_NAMES = [
+            "System.Security.Principal.Windows",
+            "System.Security.AccessControl",
+            "System.Threading.AccessControl",
+            "System.IO.FileSystem.AccessControl",
+        ]
+        for dep_name in _DEP_NAMES:
+            dep_path = os.path.join(use_dir, f"{dep_name}.dll")
+            if os.path.isfile(dep_path):
+                try:
+                    clr.AddReference(dep_path)
+                    log_fn(f"[TEMP] Pre-loaded: {dep_name}")
+                except Exception:
+                    pass  # May already be loaded or not needed
+
+        # Load main LHM DLL
+        loaded = False
+        try:
+            clr.AddReference(dll_name)
+            loaded = True
+            log_fn(f"[TEMP] Loaded via clr.AddReference(name)")
+        except Exception as e1:
+            log_fn(f"[TEMP] AddReference(name) failed: {e1}")
+
+        if not loaded:
+            try:
+                clr.AddReference(use_dll)
+                loaded = True
+                log_fn(f"[TEMP] Loaded via clr.AddReference(full_path)")
+            except Exception as e2:
+                log_fn(f"[TEMP] AddReference(full_path) failed: {e2}")
+
+        if not loaded:
+            try:
+                from System.Reflection import Assembly
+                Assembly.LoadFile(use_dll)
+                loaded = True
+                log_fn("[TEMP] Loaded via Assembly.LoadFile()")
+            except Exception as e3:
+                log_fn(f"[TEMP] Assembly.LoadFile() failed: {e3}")
+
+        if not loaded:
+            log_fn("[TEMP] All DLL loading strategies failed!")
+            return False
+
+        try:
+            from LibreHardwareMonitor.Hardware import Computer
+        except ImportError as ie:
+            log_fn(f"[TEMP] Import failed after load: {ie}")
+            log_fn("[TEMP] The DLL loaded but types could not be resolved.")
+            log_fn("[TEMP] Try deleting the LibreHardwareMonitor folder and restarting.")
+            return False
+        comp = Computer()
+        comp.IsCpuEnabled    = True
+        comp.IsGpuEnabled    = True
+        comp.IsMemoryEnabled = True
+        comp.Open()
+
+        # Enumerate all hardware & sensors for diagnostics
+        log_fn("[TEMP] === LHM Hardware & Sensors ===")
+        hw_count = 0
+        for hw in comp.Hardware:
+            hw.Update()
+            hw_count += 1
+            log_fn(f"[TEMP]  HW: {hw.Name}  Type={hw.HardwareType}")
+            sensor_count = 0
+            for s in hw.Sensors:
+                sensor_count += 1
+                val_str = f"{s.Value:.1f}" if s.Value is not None else "None"
+                log_fn(f"[TEMP]    Sensor: {s.Name}  Type={s.SensorType}  Value={val_str}")
+            if sensor_count == 0:
+                log_fn(f"[TEMP]    (no sensors found for this hardware)")
+            # Also check sub-hardware (some CPUs have sub-devices)
+            for sub in hw.SubHardware:
+                sub.Update()
+                log_fn(f"[TEMP]  SubHW: {sub.Name}  Type={sub.HardwareType}")
+                for s in sub.Sensors:
+                    val_str = f"{s.Value:.1f}" if s.Value is not None else "None"
+                    log_fn(f"[TEMP]    Sensor: {s.Name}  Type={s.SensorType}  Value={val_str}")
+        log_fn(f"[TEMP] === Total hardware items: {hw_count} ===")
+
+        if hw_count == 0:
+            log_fn("[TEMP] WARNING: LHM found no hardware! Sensors will not work.")
+
+        _lhm_computer = comp; _lhm_available = True
+        log_fn("[TEMP] LibreHardwareMonitor initialised OK"); return True
+    except Exception as e:
+        err_str = str(e)
+        log_fn(f"[TEMP] LHM init failed: {err_str}")
+        if "could not load file or assembly" in err_str.lower() or "could not load type" in err_str.lower():
+            log_fn("[TEMP] Missing .NET dependency DLLs.")
+            log_fn("[TEMP] Try deleting the LibreHardwareMonitor folder and restarting.")
+        elif "not running as admin" in err_str.lower() or "access" in err_str.lower():
+            log_fn("[TEMP] Run as Administrator to access hardware sensors.")
+        else:
+            log_fn("[TEMP] Ensure pythonnet is installed: pip install pythonnet")
+        return False
+
+_temp_debug_done = False
+
+def get_cpu_temp():
+    global _temp_debug_done
+    if not _lhm_available or _lhm_computer is None: return -1.0
+    try:
+        from LibreHardwareMonitor.Hardware import HardwareType, SensorType
+        for hw in _lhm_computer.Hardware:
+            if hw.HardwareType == HardwareType.Cpu:
+                hw.Update(); best = None
+                if not _temp_debug_done:
+                    print(f"[TEMP DBG] CPU hw found: {hw.Name} type={hw.HardwareType}")
+                    for s in hw.Sensors:
+                        val_s = f"{s.Value:.1f}" if s.Value is not None else "None"
+                        print(f"[TEMP DBG]   {s.Name} type={s.SensorType} val={val_s}")
+                    for sub in hw.SubHardware:
+                        sub.Update()
+                        print(f"[TEMP DBG]   SubHW: {sub.Name}")
+                        for s in sub.Sensors:
+                            val_s = f"{s.Value:.1f}" if s.Value is not None else "None"
+                            print(f"[TEMP DBG]     {s.Name} type={s.SensorType} val={val_s}")
+                for s in hw.Sensors:
+                    if s.SensorType == SensorType.Temperature and s.Value is not None:
+                        n = s.Name.lower()
+                        if "package" in n or "tctl" in n or "tdie" in n: return float(s.Value)
+                        if best is None: best = float(s.Value)
+                if best is not None: return best
+                # Check sub-hardware too (some Intel CPUs)
+                for sub in hw.SubHardware:
+                    sub.Update()
+                    for s in sub.Sensors:
+                        if s.SensorType == SensorType.Temperature and s.Value is not None:
+                            return float(s.Value)
+        if not _temp_debug_done:
+            print("[TEMP DBG] No CPU hardware found in LHM!")
+            print(f"[TEMP DBG] Total hardware items: {sum(1 for _ in _lhm_computer.Hardware)}")
+            for hw in _lhm_computer.Hardware:
+                print(f"[TEMP DBG]   {hw.Name} type={hw.HardwareType}")
+        return -1.0
+    except Exception as e:
+        if not _temp_debug_done: print(f"[TEMP DBG] get_cpu_temp exception: {e}")
+        return -1.0
+
+def get_gpu_temp():
+    global _temp_debug_done
+    if not _lhm_available or _lhm_computer is None: return -1.0
+    try:
+        from LibreHardwareMonitor.Hardware import HardwareType, SensorType
+        gpu_types = [HardwareType.GpuNvidia, HardwareType.GpuAmd, HardwareType.GpuIntel]
+        for hw in _lhm_computer.Hardware:
+            if hw.HardwareType in gpu_types:
+                hw.Update(); best = None
+                if not _temp_debug_done:
+                    print(f"[TEMP DBG] GPU hw found: {hw.Name} type={hw.HardwareType}")
+                    for s in hw.Sensors:
+                        val_s = f"{s.Value:.1f}" if s.Value is not None else "None"
+                        print(f"[TEMP DBG]   {s.Name} type={s.SensorType} val={val_s}")
+                for s in hw.Sensors:
+                    if s.SensorType == SensorType.Temperature and s.Value is not None:
+                        n = s.Name.lower()
+                        if "core" in n or "gpu" in n or "temperature" in n: return float(s.Value)
+                        if best is None: best = float(s.Value)
+                if best is not None: return best
+        if not _temp_debug_done:
+            print("[TEMP DBG] No GPU hardware matched gpu_types!")
+        _temp_debug_done = True
+        return -1.0
+    except Exception as e:
+        if not _temp_debug_done: print(f"[TEMP DBG] get_gpu_temp exception: {e}")
+        _temp_debug_done = True
+        return -1.0
+
+def get_gpu_usage_intel():
+    try:
+        cmd = ["typeperf", "\\GPU Engine(*)\\Utilization Percentage", "-sc", "1"]
+        out = subprocess.check_output(cmd, timeout=5, stderr=subprocess.DEVNULL,
+                                      creationflags=_NO_WINDOW).decode(errors="ignore")
+        for l in out.strip().splitlines():
+            l = l.strip()
+            if l.startswith('"') and ',' in l and "GPU Engine" not in l:
+                vals = [float(v) for v in re.findall(r'[\d]+\.[\d]+', l) if float(v) < 200]
+                return min(sum(vals), 100.0) if vals else 0.0
+        return 0.0
+    except Exception: return 0.0
+
+def get_gpu_vram_mb():
+    global _vram_failures
+    if _vram_failures >= _VRAM_MAX_FAIL: return -1
+    try:
+        cmd = ["typeperf", "\\GPU Process Memory(*)\\Dedicated Usage", "-sc", "1"]
+        out = subprocess.check_output(cmd, timeout=5, stderr=subprocess.DEVNULL,
+                                      creationflags=_NO_WINDOW).decode(errors="ignore")
+        for l in out.strip().splitlines():
+            l = l.strip()
+            if l.startswith('"') and ',' in l and "GPU Process Memory" not in l:
+                vals = [float(v) for v in re.findall(r'[\d]+\.[\d]+', l)]
+                if vals:
+                    mb = int(sum(vals) / (1024 * 1024))
+                    if mb > 0: _vram_failures = 0; return mb
+        _vram_failures += 1; return -1
+    except Exception:
+        _vram_failures += 1; return -1
+
+def get_gpu_vram_total_mb(log_fn=print):
+    """Get total GPU VRAM in MB. Tries LHM first, then nvidia-smi."""
+    # Method 1: LibreHardwareMonitor
+    if _lhm_available and _lhm_computer is not None:
+        try:
+            from LibreHardwareMonitor.Hardware import HardwareType, SensorType
+            gpu_types = [HardwareType.GpuNvidia, HardwareType.GpuAmd, HardwareType.GpuIntel]
+            found_gpu = False
+            for hw in _lhm_computer.Hardware:
+                if hw.HardwareType in gpu_types:
+                    found_gpu = True
+                    hw.Update()
+                    log_fn(f"[VRAM] GPU found: {hw.Name} ({hw.HardwareType})")
+                    for s in hw.Sensors:
+                        val_s = f"{s.Value:.1f}" if s.Value is not None else "None"
+                        log_fn(f"[VRAM]   {s.Name}  Type={s.SensorType}  Val={val_s}")
+                        if s.Value is not None and s.Value > 0:
+                            n = s.Name.lower()
+                            if s.SensorType == SensorType.SmallData and "total" in n and "memory" in n:
+                                val = int(s.Value)
+                                log_fn(f"[VRAM] MATCH (SmallData): {s.Name} = {val} MB")
+                                return val
+                            if s.SensorType == SensorType.Data and "total" in n and "memory" in n:
+                                val = int(s.Value * 1024)
+                                log_fn(f"[VRAM] MATCH (Data): {s.Name} = {val} MB")
+                                return val
+                    log_fn("[VRAM] No 'total memory' sensor matched on this GPU")
+            if not found_gpu:
+                log_fn("[VRAM] LHM has no GPU hardware entries")
+        except Exception as e:
+            log_fn(f"[WARN] LHM VRAM total failed: {e}")
+    else:
+        log_fn("[VRAM] LHM not available, skipping")
+    # Method 2: nvidia-smi
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            timeout=5, stderr=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW).decode().strip()
+        val = int(out.split("\n")[0].strip())
+        if val > 0:
+            log_fn(f"[VRAM] nvidia-smi total: {val} MB")
+            return val
+    except FileNotFoundError:
+        log_fn("[VRAM] nvidia-smi not found (no NVIDIA GPU?)")
+    except Exception as e:
+        log_fn(f"[VRAM] nvidia-smi failed: {e}")
+    # Method 3: Windows Registry (handles >4GB correctly, 64-bit QWORD)
+    try:
+        import winreg
+        base = r"SYSTEM\ControlSet001\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        i = 0
+        while True:
+            try:
+                subkey = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{base}\\{i:04d}")
+                try:
+                    val, _ = winreg.QueryValueEx(subkey, "HardwareInformation.qwMemorySize")
+                    if val and val > 0:
+                        val_mb = int(val) // (1024 * 1024)
+                        log_fn(f"[VRAM] Registry qwMemorySize: {val_mb} MB")
+                        if val_mb > 0:
+                            return val_mb
+                except FileNotFoundError:
+                    pass
+                winreg.CloseKey(subkey)
+                i += 1
+            except OSError:
+                break
+        log_fn("[VRAM] Registry: no qwMemorySize found")
+    except Exception as e:
+        log_fn(f"[VRAM] Registry failed: {e}")
+    # Method 4: WMI fallback (caps at 4GB for >4GB GPUs)
+    try:
+        out = subprocess.check_output(
+            ["wmic", "path", "Win32_VideoController", "get", "AdapterRAM", "/value"],
+            timeout=5, stderr=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW).decode().strip()
+        log_fn(f"[VRAM] WMI raw output: {out!r}")
+        for line in out.splitlines():
+            if "AdapterRAM=" in line:
+                val_bytes = int(line.split("=")[1].strip())
+                if val_bytes > 0:
+                    val_mb = val_bytes // (1024 * 1024)
+                    if val_mb >= 4095:
+                        log_fn(f"[VRAM] WMI: {val_mb} MB (likely capped at 4GB -- real value may be higher)")
+                    else:
+                        log_fn(f"[VRAM] WMI total: {val_mb} MB")
+                    return val_mb
+    except Exception as e:
+        log_fn(f"[VRAM] WMI failed: {e}")
+    log_fn("[WARN] Could not detect total VRAM")
+    return -1
+
+def get_link_speed_mbps():
+    try:
+        stats = psutil.net_if_stats(); addrs = psutil.net_if_addrs(); best = 0
+        for name, st in stats.items():
+            if not st.isup or st.speed == 0: continue
+            nl = name.lower()
+            if "loopback" in nl or nl == "lo": continue
+            if name in addrs:
+                has_ip = any(a.family.name == 'AF_INET' and not a.address.startswith('169.254')
+                             for a in addrs[name])
+                if has_ip and st.speed > best: best = st.speed
+        if best == 0:
+            for name, st in stats.items():
+                if st.isup and st.speed > best: best = st.speed
+        return best if best > 0 else 1000
+    except Exception: return 1000
+
+class NetSpeed:
+    def __init__(self):
+        c = psutil.net_io_counters()
+        self.prev_recv = c.bytes_recv; self.prev_sent = c.bytes_sent
+        self.prev_time = time.time()
+    def update(self):
+        c = psutil.net_io_counters(); now = time.time(); dt = now - self.prev_time
+        if dt <= 0: return 0, 0
+        dl = (c.bytes_recv - self.prev_recv) / dt / 1024.0
+        ul = (c.bytes_sent - self.prev_sent) / dt / 1024.0
+        self.prev_recv = c.bytes_recv; self.prev_sent = c.bytes_sent; self.prev_time = now
+        return int(round(dl)), int(round(ul))
+
+def wait_for_ready(ser, timeout_s=3.0, log_fn=print, lcd_fn=None):
+    log_fn("Waiting for MCU READY...")
+    end = time.time() + timeout_s
+    while time.time() < end:
+        line = ser.readline().decode(errors="ignore").strip()
+        if line:
+            log_fn(f"RX: {line}")
+            # Detect LCD discovery reports  (FOUND_LCD=0x27)
+            if lcd_fn:
+                m = re.search(r"FOUND_LCD=0x([0-9A-Fa-f]+)", line, re.IGNORECASE)
+                if m:
+                    lcd_fn("0x" + m.group(1).upper())
+            if "READY" in line:
+                return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MONITOR THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MonitorThread(threading.Thread):
+    def __init__(self, cfg, log_q, stats_q, lcd_q, stop_event):
+        super().__init__(daemon=True)
+        self.cfg        = cfg
+        self.log_q      = log_q
+        self.stats_q    = stats_q
+        self.lcd_q      = lcd_q        # ← queue for discovered LCD addresses
+        self.stop_event = stop_event
+
+    def log(self, msg): self.log_q.put(msg)
+
+    def _on_lcd_found(self, addr_str):
+        """Called when Arduino reports a discovered LCD during boot."""
+        self.lcd_q.put(addr_str)
+
+    def run(self):
+        cfg = self.cfg
+        self.log("─" * 55)
+        self.log("[INFO] PC Monitor starting up...")
+        self.log(f"[INFO] Port: {cfg['port']}  Baud: {cfg['baud']}")
+
+        if not PSUTIL_OK:
+            self.log("[ERROR] psutil not installed.  pip install psutil"); return
+        if not SERIAL_OK:
+            self.log("[ERROR] pyserial not installed.  pip install pyserial"); return
+
+        # LHM / temperature init
+        global _lhm_computer, _lhm_available, _lhm_init_tried
+        _lhm_computer = None; _lhm_available = False; _lhm_init_tried = False
+        dll = cfg["lhm_path"]
+
+        # Auto-download DLL and install pythonnet if needed
+        dll = _ensure_lhm_deps(dll, self.log)
+
+        if os.path.isfile(dll):
+            self.log(f"[INFO] LHM DLL found: {dll}")
+        else:
+            self.log(f"[WARN] LHM DLL not found: {dll}")
+            self.log("[WARN] CPU/GPU temperatures will show as N/A")
+        _init_lhm(dll, self.log)
+        if _lhm_available:
+            self.log("[OK]   LibreHardwareMonitor ready -- temperatures enabled")
+        else:
+            self.log("[WARN] Temperatures disabled (LHM unavailable)")
+
+        # page_order is a list like [0,2,1,3] (indices: CPU=0 GPU=1 RAM=2 NET=3)
+        page_order = cfg.get("page_order", [0, 1, 2, 3])
+        page_names = ["CPU", "GPU", "RAM", "NET"]
+        mask = sum(1 << i for i in page_order)
+        if mask == 0: self.log("[WARN] No pages -- enabling CPU fallback."); mask = 1; page_order = [0]
+
+        self.log(f"[INFO] Page order: {' -> '.join(page_names[i] for i in page_order)}  |  Delay: {cfg['page_delay']} ms")
+
+        raw_mb    = int(psutil.virtual_memory().total / (1024 * 1024))
+        common_gb = [4,8,12,16,24,32,48,64,96,128,256]
+        ram_gb    = min((g for g in common_gb if g >= raw_mb/1024.0), default=common_gb[-1])
+        ram_total = ram_gb * 1024
+        self.log(f"[INFO] RAM: {raw_mb} MB  ->  {ram_gb} GB")
+
+        vram_total = get_gpu_vram_total_mb(self.log)
+
+        link_speed = get_link_speed_mbps()
+        self.log(f"[INFO] NIC link: {link_speed} Mbps")
+
+        psutil.cpu_percent(interval=None)
+        net = NetSpeed()
+
+        # Build LCD2004 field from GUI config:
+        # lcd_types is a dict { "0x27": "1602", "0x26": "2004", ... }
+        def build_lcd2004_field():
+            lt = cfg.get("lcd_types", {})
+            addrs = [str(int(a, 16)) for a, t in lt.items() if t == "2004"]
+            return f"LCD2004={','.join(addrs)}" if addrs else ""
+
+        try:
+            import serial as ser_mod
+            with ser_mod.Serial(cfg["port"], cfg["baud"], timeout=0.2) as ser:
+                try: ser.dtr = False; ser.rts = False
+                except Exception: pass
+                time.sleep(0.2)
+                ser.reset_input_buffer(); ser.reset_output_buffer()
+                if not wait_for_ready(ser, 8.0, self.log, self._on_lcd_found):
+                    self.log("[INFO] No READY seen -- continuing anyway.")
+                self.log(f"[OK] Connected to {cfg['port']} @ {cfg['baud']} baud")
+
+                while not self.stop_event.is_set():
+                    cpu     = psutil.cpu_percent(interval=0.0)
+                    mem     = psutil.virtual_memory()
+                    ram     = mem.percent
+                    ram_mb  = int(mem.used / (1024 * 1024))
+                    gpu     = get_gpu_usage_intel()
+                    vram_mb = get_gpu_vram_mb()
+                    cpu_t   = get_cpu_temp()
+                    gpu_t   = get_gpu_temp()
+                    dl_kb, ul_kb = net.update()
+
+                    stats_now = {
+                        "cpu": cpu, "cpu_temp": cpu_t,
+                        "gpu": gpu, "gpu_temp": gpu_t,
+                        "ram": ram, "ram_mb": ram_mb, "ram_total_mb": ram_total,
+                        "vram_mb": vram_mb, "vram_total_mb": vram_total,
+                        "dl_kb": dl_kb, "ul_kb": ul_kb,
+                        "link_speed": link_speed,
+                    }
+
+                    cpu10  = int(round(cpu * 10))
+                    ram10  = int(round(ram * 10))
+                    gpu10  = int(round(gpu * 10))
+                    temp10 = int(round(cpu_t * 10)) if cpu_t >= 0 else -1
+                    gput10 = int(round(gpu_t * 10)) if gpu_t >= 0 else -1
+                    pd     = cfg["page_delay"]
+
+                    # LCD type config field
+                    lcd2004_field = build_lcd2004_field()
+
+                    pgord_str = ",".join(str(i) for i in page_order)
+                    parts = [
+                        f"CPU={cpu10};RAM={ram10};GPU={gpu10}",
+                        f"DL={dl_kb};UL={ul_kb}",
+                        f"RAMU={ram_mb};RAMT={int(ram_total)};VRAM={vram_mb};VRAMT={vram_total}",
+                        f"TEMP={temp10};GPUT={gput10}",
+                        f"LSPD={link_speed};PG={mask};PDLY={pd};PGORD={pgord_str}",
+                    ]
+                    if lcd2004_field:
+                        parts.append(lcd2004_field)
+
+                    line = ";".join(parts) + "\r\n"
+                    ser.write(line.encode("ascii")); ser.flush()
+                    self.log(f"[DBG] RAW TX ({len(line)-2} chars): {line.strip()}")
+
+                    # Inject IDENT command if requested by GUI
+                    if getattr(self, '_app_ident_pending', False):
+                        ser.write(b"IDENT\r\n"); ser.flush()
+                        self._app_ident_pending = False
+
+                    ct_s = f"{cpu_t:.1f}°C" if cpu_t >= 0 else "N/A"
+                    gt_s = f"{gpu_t:.1f}°C" if gpu_t >= 0 else "N/A"
+                    vt_s = f"{vram_mb}/{vram_total}MB" if vram_total > 0 else (f"{vram_mb}MB" if vram_mb >= 0 else "N/A")
+                    self.log(
+                        f"TX | CPU {cpu:5.1f}% {ct_s:>7} | "
+                        f"GPU {gpu:5.1f}% {gt_s:>7} VRAM:{vt_s} | "
+                        f"RAM {ram:5.1f}% {ram_mb}MB | "
+                        f"DL:{dl_kb}K UL:{ul_kb}K")
+                    self.stats_q.put(stats_now)
+
+                    time.sleep(0.05)
+                    while ser.in_waiting:
+                        rx = ser.readline().decode(errors="ignore").strip()
+                        if rx:
+                            self.log(f"RX: {rx}")
+                            m = re.search(r"FOUND_LCD=0x([0-9A-Fa-f]+)", rx, re.IGNORECASE)
+                            if m: self._on_lcd_found("0x" + m.group(1).upper())
+
+                    # Read any Arduino responses
+                    deadline = time.time() + 0.9
+                    while time.time() < deadline:
+                        if ser.in_waiting:
+                            rx = ser.readline().decode(errors="ignore").strip()
+                            if rx:
+                                self.log(f"RX: {rx}")
+                                m = re.search(r"FOUND_LCD=0x([0-9A-Fa-f]+)", rx, re.IGNORECASE)
+                                if m: self._on_lcd_found("0x" + m.group(1).upper())
+                        else:
+                            time.sleep(0.05)
+
+        except Exception as e:
+            self.log(f"[ERROR] {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        self.log("[INFO] Monitor stopped.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REUSABLE WIDGETS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StatBar(tk.Frame):
+    def __init__(self, parent, label, **kw):
+        super().__init__(parent, bg=BG2, **kw)
+        tk.Label(self, text=label, bg=BG2, fg=TEXT_DIM,
+                 font=("Consolas", 9), width=5, anchor="e").pack(side="left", padx=(6,4))
+        self._canvas = tk.Canvas(self, bg=BG3, height=14, highlightthickness=0)
+        self._canvas.pack(side="left", fill="x", expand=True, pady=3)
+        self._bar = self._canvas.create_rectangle(0, 0, 0, 14, fill=GREEN, outline="")
+        self._val = tk.Label(self, text="  0.0%", bg=BG2, fg=TEXT,
+                              font=("Consolas", 9), width=12, anchor="w")
+        self._val.pack(side="left", padx=(4, 6))
+
+    def set(self, pct, label=""):
+        w = self._canvas.winfo_width()
+        fill = max(0, min(w, int(w * pct / 100)))
+        self._canvas.coords(self._bar, 0, 0, fill, 14)
+        c = GREEN if pct < 60 else (YELLOW if pct < 85 else RED)
+        self._canvas.itemconfig(self._bar, fill=c)
+        self._val.config(text=label or f"{pct:5.1f}%")
+
+
+class TempLabel(tk.Label):
+    def set(self, val):
+        if val < 0: self.config(text="", fg=TEXT_DIM)
+        else:
+            c = GREEN if val < 65 else (YELLOW if val < 80 else RED)
+            self.config(text=f" {val:.1f}°C", fg=c)
+
+
+CELL_W, CELL_H = 14, 20
+
+class LCDWidget(tk.Canvas):
+    PAD_X, PAD_Y = 14, 10
+    def __init__(self, parent, **kw):
+        w = 16 * CELL_W + self.PAD_X * 2
+        h = 2  * CELL_H + self.PAD_Y * 2 + 8
+        super().__init__(parent, width=w, height=h, bg=LCD_FRAME, highlightthickness=0, **kw)
+        self.create_rectangle(0, 0, w, h, fill=LCD_FRAME, outline="")
+        sx, sy = self.PAD_X-6, self.PAD_Y-4
+        self.create_rectangle(sx, sy, w-sx, h-sy, fill=LCD_BG, outline="#1a2e1a", width=2)
+        self._cells = []
+        for row in range(2):
+            row_items = []
+            for col in range(16):
+                x = self.PAD_X + col * CELL_W + CELL_W // 2
+                y = self.PAD_Y + row * (CELL_H + 8) + CELL_H // 2
+                row_items.append(self.create_text(x, y, text=" ", fill=LCD_DIM,
+                                                   font=("Courier", 11, "bold"), anchor="center"))
+            self._cells.append(row_items)
+
+    def set_lines(self, line1, line2):
+        for row, line in enumerate([line1[:16].ljust(16), line2[:16].ljust(16)]):
+            for col, ch in enumerate(line):
+                self.itemconfig(self._cells[row][col], text=ch,
+                                fill=LCD_ON if ch != " " else LCD_DIM)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PC Monitor Sender -- Rozakos Industries")
+        self.configure(bg=BG)
+        self.geometry("1380x960")
+        self.minsize(1100, 780)
+        # Set window icon
+        try:
+            if os.path.isfile(BRAND_ICO):
+                self.iconbitmap(BRAND_ICO)
+        except Exception:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self._quit_app)
+        self._tray_icon = None
+        self._tray_thread = None
+        self._ident_cmd_pending = False
+        # Launched by the boot task? -> start hidden in the tray.
+        self._start_minimized = _MINIMIZED_FLAG in _sys.argv
+
+        self._stop_event   = threading.Event()
+        self._thread       = None
+        self._log_q        = queue.Queue()
+        self._stats_q      = queue.Queue()
+        self._lcd_q        = queue.Queue()   # discovered LCD addresses
+        self._running      = False
+        self._latest_stats = {}
+        # Pinned boot port: when set, _refresh_ports always prefers this device
+        # (raw "COMx") over the USB auto-detect. None = auto-detect.
+        self._default_port = None
+
+        # LCD type config:  { "0x27": "1602", "0x26": "2004", ... }
+        self._lcd_types: dict[str, str] = {}
+        # Per-address StringVars bound to the OptionMenus in the LCD config panel
+        self._lcd_type_vars: dict[str, tk.StringVar] = {}
+        # The inner frame that holds the LCD config rows (populated dynamically)
+        self._lcd_cfg_inner: tk.Frame | None = None
+        self._lcd_hint_lbl:  tk.Label | None = None
+
+
+        self._style_notebook()
+        self._style_combobox()
+        self.withdraw()            # hide main window until splash done
+        self.after(0, self._show_splash)
+
+    # ── NOTEBOOK STYLE ────────────────────────────────────────────────────────
+    def _style_combobox(self):
+        s = ttk.Style(self)
+        s.configure("TCombobox",
+                     fieldbackground=BG3,
+                     background=BG3,
+                     foreground=TEXT,
+                     selectbackground=ACCENT,
+                     selectforeground="#1a1b26",
+                     arrowcolor=TEXT_DIM,
+                     borderwidth=0)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", BG3), ("!readonly", BG3)],
+              foreground=[("readonly", TEXT), ("!readonly", TEXT)],
+              background=[("active", BG2), ("!active", BG3)])
+        self.option_add("*TCombobox*Listbox.background", BG2)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", "#1a1b26")
+        self.option_add("*TCombobox*Listbox.font", ("Consolas", 10))
+
+    def _style_notebook(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TNotebook",     background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background=BG3, foreground=TEXT_DIM,
+                     font=("Segoe UI", 9, "bold"), padding=[14, 6])
+        s.map("TNotebook.Tab",
+              background=[("selected", BG2)],
+              foreground=[("selected", ACCENT)])
+
+    # ── SPLASH SCREEN ────────────────────────────────────────────────────────
+    def _show_splash(self):
+        """Branded splash for ~2 seconds with animated loading bar."""
+        splash = tk.Toplevel(self)
+        splash.overrideredirect(True)
+        splash.configure(bg=BG)
+        splash.attributes("-topmost", True)
+        try:
+            if os.path.isfile(BRAND_ICO):
+                splash.iconbitmap(BRAND_ICO)
+        except Exception:
+            pass
+
+        # Logo
+        try:
+            import base64 as _b64, io as _io
+            from PIL import Image as _Img, ImageTk as _ITk
+            raw   = _b64.b64decode(_FULL_LOGO_B64)
+            pimg  = _Img.open(_io.BytesIO(raw)).convert("RGBA")
+            tkimg = _ITk.PhotoImage(pimg)
+            lbl   = tk.Label(splash, image=tkimg, bg=BG)
+            lbl.image = tkimg
+            lbl.pack(padx=50, pady=(40, 6))
+        except Exception:
+            tk.Label(splash, text="ROZAKOS INDUSTRIES",
+                     bg=BG, fg="#9e1a1a",
+                     font=("Segoe UI", 22, "bold")).pack(padx=60, pady=(40, 8))
+
+        tk.Label(splash, text=f"PC Monitor Sender  v{APP_VERSION}",
+                 bg=BG, fg=ACCENT, font=("Segoe UI", 10)).pack(pady=(4, 2))
+        tk.Label(splash, text=BRAND_URL,
+                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(pady=(0, 28))
+
+        # Animated loading bar at very bottom
+        bar_bg   = tk.Frame(splash, bg=BG3, height=4)
+        bar_bg.pack(fill="x", side="bottom")
+        bar_fill = tk.Frame(bar_bg, bg=ACCENT, height=4)
+        bar_fill.place(x=0, y=0, relheight=1, width=0)
+
+        splash.update_idletasks()
+        sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
+        w,  h  = splash.winfo_width(), splash.winfo_height()
+        splash.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+        DURATION, STEPS = 1800, 60
+
+        def _step(i=0):
+            if not splash.winfo_exists():
+                return
+            bar_fill.place_configure(width=int(bar_bg.winfo_width() * i / STEPS))
+            if i < STEPS:
+                splash.after(DURATION // STEPS, _step, i + 1)
+            else:
+                splash.after(150, _finish)
+
+        def _finish():
+            try:
+                splash.destroy()
+            except Exception:
+                pass
+            self._build_ui()
+            self._apply_settings(load_settings())   # restore last-used config
+            self._poll()
+            if self._start_minimized and TRAY_OK:
+                # Boot launch: stay hidden, drop straight into the tray.
+                self._start_tray()
+            else:
+                self.deiconify()
+            if self._start_minimized:
+                # Boot launch: begin monitoring once the port scan has run.
+                self.after(1200, self._autostart_monitor)
+
+        splash.after(50, _step)
+
+    # ── ABOUT DIALOG ─────────────────────────────────────────────────────────
+    def _show_about(self):
+        """Modal About dialog with logo, version and links."""
+        dlg = tk.Toplevel(self)
+        dlg.title("About")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()          # modal
+        dlg.attributes("-topmost", True)
+        try:
+            if os.path.isfile(BRAND_ICO):
+                dlg.iconbitmap(BRAND_ICO)
+        except Exception:
+            pass
+
+        # Logo
+        try:
+            import base64 as _b64, io as _io
+            from PIL import Image as _Img, ImageTk as _ITk
+            raw   = _b64.b64decode(_FULL_LOGO_B64)
+            pimg  = _Img.open(_io.BytesIO(raw)).convert("RGBA")
+            tkimg = _ITk.PhotoImage(pimg)
+            lbl   = tk.Label(dlg, image=tkimg, bg=BG)
+            lbl.image = tkimg
+            lbl.pack(padx=40, pady=(30, 4))
+        except Exception:
+            tk.Label(dlg, text="ROZAKOS INDUSTRIES",
+                     bg=BG, fg="#9e1a1a",
+                     font=("Segoe UI", 18, "bold")).pack(pady=(30, 4))
+
+        tk.Label(dlg, text="PC Monitor Sender",
+                 bg=BG, fg=TEXT, font=("Segoe UI", 12, "bold")).pack()
+        tk.Label(dlg, text=f"Version {APP_VERSION}",
+                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(pady=(2, 12))
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=24, pady=4)
+
+        # Changelog
+        tk.Label(dlg, text="Changelog", bg=BG, fg=ACCENT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=28, pady=(8,2))
+        tk.Label(dlg, text="v1.0.0\n  • Initial release\n  • CPU, GPU, RAM, Network monitoring\n  • Multi-LCD support (1602 / 2004)\n  • System tray, page order editor\n  • LibreHardwareMonitor integration",
+                 bg=BG, fg=TEXT_DIM, font=("Consolas", 8),
+                 justify="left").pack(anchor="w", padx=32, pady=(0,12))
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=24, pady=4)
+
+        # Links
+        import webbrowser
+        links_frame = tk.Frame(dlg, bg=BG)
+        links_frame.pack(pady=12)
+
+        def link(parent, text, target):
+            l = tk.Label(parent, text=text, bg=BG, fg=ACCENT2,
+                         font=("Segoe UI", 9, "underline"), cursor="hand2")
+            l.pack(side="left", padx=10)
+            l.bind("<Button-1>", lambda e: webbrowser.open(target))
+            l.bind("<Enter>", lambda e: l.config(fg=ACCENT))
+            l.bind("<Leave>", lambda e: l.config(fg=ACCENT2))
+
+        link(links_frame, "🌐  " + BRAND_URL, BRAND_URL)
+        link(links_frame, "✉  " + BRAND_EMAIL, "mailto:" + BRAND_EMAIL)
+
+        tk.Button(dlg, text="Close", bg=BG3, fg=TEXT_DIM,
+                  font=("Segoe UI", 9), relief="flat", padx=20, pady=6,
+                  cursor="hand2", command=dlg.destroy).pack(pady=(4, 24))
+
+        dlg.update_idletasks()
+        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+        w, h   = dlg.winfo_width(), dlg.winfo_height()
+        dlg.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+    # ── TOP BAR + NOTEBOOK ────────────────────────────────────────────────────
+    def _build_ui(self):
+        top = tk.Frame(self, bg=BG, pady=8); top.pack(fill="x", padx=12)
+        tk.Label(top, text="⬡  PC Monitor Sender", bg=BG, fg=ACCENT,
+                 font=("Segoe UI", 14, "bold")).pack(side="left")
+        # Start-on-boot toggle (prominent, in the header).
+        self._startup_var = tk.BooleanVar(value=_startup_enabled())
+        tk.Checkbutton(
+            top, text="  ⏻ Start on boot (to tray)",
+            variable=self._startup_var, command=self._toggle_startup,
+            bg=BG, fg=TEXT, selectcolor=BG3, activebackground=BG,
+            activeforeground=TEXT, font=("Segoe UI", 9), cursor="hand2",
+            highlightthickness=0, bd=0).pack(side="left", padx=(18, 0))
+        self._status_dot = tk.Label(top, text="●", bg=BG, fg=TEXT_DIM, font=("Segoe UI", 16))
+        self._status_dot.pack(side="right", padx=(0,4))
+        self._status_lbl = tk.Label(top, text="Stopped", bg=BG, fg=TEXT_DIM, font=("Segoe UI", 10))
+        self._status_lbl.pack(side="right")
+        if TRAY_OK:
+            tk.Button(top, text="⊖  Minimize to Tray",
+                      bg=BG3, fg=TEXT_DIM, font=("Segoe UI", 8),
+                      relief="flat", padx=8, pady=3, cursor="hand2",
+                      command=self._on_close).pack(side="right", padx=(0,4))
+        else:
+            tk.Button(top, text="⊖  Minimize to Tray (needs pystray)",
+                      bg=BG3, fg=BORDER, font=("Segoe UI", 8),
+                      relief="flat", padx=8, pady=3, cursor="hand2",
+                      command=lambda: self._append_log(
+                          "[WARN] Install pystray + Pillow for system tray:  pip install pystray Pillow")
+                      ).pack(side="right", padx=(0,4))
+        tk.Button(top, text="?",
+                  bg=BG3, fg=TEXT_DIM, font=("Segoe UI", 9, "bold"),
+                  relief="flat", width=3, pady=3, cursor="hand2",
+                  command=self._show_about).pack(side="right", padx=(0,4))
+
+        self._build_footer()   # footer sits at the very bottom
+        nb = ttk.Notebook(self); nb.pack(fill="both", expand=True, padx=10, pady=(0,4))
+        dash = tk.Frame(nb, bg=BG); nb.add(dash, text="  Dashboard  ")
+
+        self._build_dashboard(dash)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  TAB 1 -- DASHBOARD
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_dashboard(self, parent):
+        parent.columnconfigure(0, weight=3, minsize=320)
+        parent.columnconfigure(1, weight=4, minsize=380)
+        parent.rowconfigure(0, weight=3)   # stats (taller)
+        parent.rowconfigure(1, weight=2)   # log
+        parent.rowconfigure(2, weight=0)   # button bar (fixed height)
+        self._build_settings(parent)
+        self._build_stats(parent)
+        self._build_log(parent)
+        # ── Fixed Start / Stop bar ────────────────────────────────────────────
+        bf = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        bf.grid(row=2, column=0, sticky="ew", padx=(0,6), pady=(0,6))
+        self._start_btn = tk.Button(bf, text="▶  Start", bg=GREEN, fg="#1a1b26",
+                                     font=("Segoe UI",10,"bold"), relief="flat",
+                                     padx=20, pady=8, cursor="hand2", command=self._start)
+        self._start_btn.pack(side="left", padx=10, pady=6)
+        self._stop_btn = tk.Button(bf, text="■  Stop", bg=BG3, fg=TEXT_DIM,
+                                    font=("Segoe UI",10,"bold"), relief="flat",
+                                    padx=20, pady=8, state="disabled", cursor="hand2",
+                                    command=self._stop)
+        self._stop_btn.pack(side="left")
+
+    # ── SETTINGS (left column) ────────────────────────────────────────────────
+    def _build_settings(self, parent):
+        f = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        f.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0,6), pady=(6,0))
+        f.columnconfigure(1, weight=1)
+
+        row = 0
+        def lbl(t, r):
+            tk.Label(f, text=t, bg=BG2, fg=TEXT_DIM, font=("Segoe UI",9), anchor="w").grid(
+                row=r, column=0, sticky="w", padx=(10,4), pady=4)
+        def ent(r, val, w=14):
+            v = tk.StringVar(value=val)
+            tk.Entry(f, textvariable=v, bg=BG3, fg=TEXT, insertbackground=TEXT, relief="flat",
+                     font=("Consolas",10), width=w, highlightbackground=BORDER, highlightthickness=1
+                     ).grid(row=r, column=1, sticky="ew", padx=(0,10), pady=4)
+            return v
+
+        # ── Connection ────────────────────────────────────────────────────────
+        tk.Label(f, text="Connection", bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=2,
+                                                     sticky="w", padx=10, pady=(10,2)); row+=1
+        # ── COM Port dropdown ─────────────────────────────────────────────────
+        lbl("COM Port", row)
+        port_frame = tk.Frame(f, bg=BG2)
+        port_frame.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
+        port_frame.columnconfigure(0, weight=1)
+        self._port_var = tk.StringVar(value="COM10")
+        self._port_cb = ttk.Combobox(
+            port_frame, textvariable=self._port_var,
+            font=("Consolas", 10), state="normal", width=36)
+        self._port_cb.pack(side="left", fill="x", expand=True)
+        tk.Button(port_frame, text="⟳", bg=BG3, fg=TEXT,
+                  font=("Segoe UI", 10), relief="flat", padx=6,
+                  command=self._refresh_ports,
+                  cursor="hand2").pack(side="left", padx=(4, 0))
+        self._port_cb.bind("<<ComboboxSelected>>", self._on_port_selected)
+        row+=1
+        # ── Pin selected port as the boot default ─────────────────────────────
+        self._pin_port_var = tk.BooleanVar(value=False)
+        self._pin_cb = tk.Checkbutton(
+            f, variable=self._pin_port_var, command=self._toggle_pin_port,
+            text="  📌 Pin selected port as boot default",
+            bg=BG2, fg=TEXT_DIM, selectcolor=BG3, activebackground=BG2,
+            activeforeground=TEXT, font=("Segoe UI", 8), anchor="w",
+            highlightthickness=0, bd=0)
+        self._pin_cb.grid(row=row, column=1, sticky="w", padx=(0,10), pady=(0,2))
+        row+=1
+        self.after(100, self._refresh_ports)   # populate on startup
+        lbl("Baud Rate", row); self._baud_var = ent(row, "115200", 10); row+=1
+
+        # ── LHM DLL path + browse ─────────────────────────────────────────────
+        lbl("LHM DLL", row)
+        df = tk.Frame(f, bg=BG2); df.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
+        df.columnconfigure(0, weight=1)
+        _local_dll = os.path.join(
+            _APP_DIR,
+            "LibreHardwareMonitor", "LibreHardwareMonitorLib.dll")
+        _default_dll = (_local_dll if os.path.isfile(_local_dll)
+                        else r"C:\TOOLS\LibreHardwareMonitor\LibreHardwareMonitorLib.dll")
+        self._lhm_var = tk.StringVar(value=_default_dll)
+        tk.Entry(df, textvariable=self._lhm_var, bg=BG3, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", font=("Consolas",8), highlightbackground=BORDER,
+                 highlightthickness=1).grid(row=0, column=0, sticky="ew")
+        tk.Button(df, text="...", bg=BG3, fg=TEXT, relief="flat", font=("Segoe UI",9), padx=4,
+                  command=self._browse_dll).grid(row=0, column=1, padx=(4,0))
+        # DLL status indicator -- updates whenever path changes
+        self._dll_status_var = tk.StringVar()
+        self._dll_status_lbl = tk.Label(f, textvariable=self._dll_status_var,
+                                         bg=BG2, font=("Segoe UI", 8), anchor="w")
+        self._dll_status_lbl.grid(row=row+1, column=0, columnspan=2,
+                                   sticky="w", padx=12, pady=(0, 2))
+        # Admin warning row
+        self._admin_lbl = tk.Label(f,
+            text="⚠  Run as Administrator for temperatures",
+            bg=BG2, fg=YELLOW, font=("Segoe UI", 8), anchor="w")
+        self._admin_lbl.grid(row=row+2, column=0, columnspan=2,
+                              sticky="w", padx=12, pady=(0, 4))
+        self._lhm_var.trace_add("write", lambda *_: self._check_dll())
+        self.after(100, self._check_dll)   # initial check after UI is built
+        self.after(150, self._check_admin)
+        row+=3
+
+        # LHM Downloader card
+        dl_frame = tk.Frame(f, bg=BG3, padx=8, pady=6)
+        dl_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,4))
+        dl_frame.columnconfigure(1, weight=1)
+        row+=1
+
+        hf = tk.Frame(dl_frame, bg=BG3); hf.grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(hf, text="⬇", bg=BG3, fg=ACCENT, font=("Segoe UI",11)).pack(side="left")
+        tk.Label(hf, text="  LibreHardwareMonitor", bg=BG3, fg=TEXT,
+                 font=("Segoe UI",9,"bold")).pack(side="left")
+        tk.Label(hf, text="  -- needed for CPU/GPU temperatures",
+                 bg=BG3, fg=TEXT_DIM, font=("Segoe UI",8)).pack(side="left")
+
+        tk.Label(dl_frame, text="Folder:", bg=BG3, fg=TEXT_DIM,
+                 font=("Segoe UI",8)).grid(row=1, column=0, sticky="w", pady=(6,2))
+        self._lhm_dest_var = tk.StringVar(value=os.path.join(
+            _APP_DIR, "LibreHardwareMonitor"))
+        dest_row = tk.Frame(dl_frame, bg=BG3)
+        dest_row.grid(row=1, column=1, sticky="ew", pady=(6,2), padx=(4,0))
+        dest_row.columnconfigure(0, weight=1)
+        tk.Entry(dest_row, textvariable=self._lhm_dest_var, bg=BG, fg=TEXT_DIM,
+                 insertbackground=TEXT, relief="flat", font=("Consolas",7),
+                 highlightbackground=BORDER, highlightthickness=1,
+                 state="readonly").grid(row=0, column=0, sticky="ew")
+        tk.Button(dest_row, text="...", bg=BG3, fg=TEXT_DIM, relief="flat",
+                  font=("Segoe UI",8), padx=3,
+                  command=self._browse_lhm_dest).grid(row=0, column=1, padx=(3,0))
+
+        self._dl_progress = ttk.Progressbar(dl_frame, mode="determinate", maximum=100)
+        self._dl_progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6,2))
+        self._dl_status_var = tk.StringVar(value="Download the latest release from GitHub")
+        self._dl_status_lbl = tk.Label(dl_frame, textvariable=self._dl_status_var,
+                                        bg=BG3, fg=TEXT_DIM, font=("Consolas",7), anchor="w")
+        self._dl_status_lbl.grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        self._dl_btn = tk.Button(
+            dl_frame, text="⬇  Download & Install Latest Release",
+            bg=ACCENT, fg="#1a1b26", font=("Segoe UI",9,"bold"),
+            relief="flat", padx=10, pady=5, cursor="hand2",
+            command=self._start_lhm_download)
+        self._dl_btn.grid(row=4, column=0, columnspan=2, pady=(8,0), sticky="ew")
+
+        # ── LHM Downloader ────────────────────────────────────────────────────
+        ttk.Separator(f, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=6); row+=1
+
+        # ── Screen Page Order ─────────────────────────────────────────────────
+        tk.Label(f, text="Screen Page Order", bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=2,
+                                                     sticky="w", padx=10, pady=(0,2)); row+=1
+        tk.Label(f, text="  ☑ enable  ·  ▲▼ reorder  ·  disabled rows are skipped",
+                 bg=BG2, fg=TEXT_DIM, font=("Segoe UI", 7)).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0,4)); row+=1
+
+        # Page colours
+        self._page_colors = {"CPU": ACCENT, "GPU": ACCENT2, "RAM": GREEN, "NET": YELLOW}
+        # (page_id, name, enabled_BooleanVar)
+        self._page_order = [
+            (0, "CPU", tk.BooleanVar(value=True)),
+            (1, "GPU", tk.BooleanVar(value=True)),
+            (2, "RAM", tk.BooleanVar(value=True)),
+            (3, "NET", tk.BooleanVar(value=False)),
+        ]
+        self._order_frame = tk.Frame(f, bg=BG2)
+        self._order_frame.grid(row=row, column=0, columnspan=2,
+                                sticky="ew", padx=10, pady=(0,4)); row+=1
+        self._order_frame.columnconfigure(0, weight=1)
+        self._rebuild_order_rows()
+
+        ttk.Separator(f, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=6); row+=1
+
+        # ── Page Delay ────────────────────────────────────────────────────────
+        tk.Label(f, text="Page Delay", bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=2,
+                                                     sticky="w", padx=10, pady=(0,2)); row+=1
+        lbl("Delay", row)
+        sf = tk.Frame(f, bg=BG2); sf.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
+        self._delay_var = tk.IntVar(value=6000)
+        tk.Scale(sf, from_=1000, to=15000, resolution=500, orient="horizontal",
+                 variable=self._delay_var, bg=BG2, fg=TEXT, troughcolor=BG3,
+                 highlightthickness=0, activebackground=ACCENT, showvalue=False,
+                 command=lambda _: self._dlbl.config(
+                     text=f"{self._delay_var.get()/1000:.1f} s")
+                 ).pack(side="left", fill="x", expand=True)
+        self._dlbl = tk.Label(sf, text="6.0 s", bg=BG2, fg=ACCENT2,
+                               font=("Consolas",9), width=5)
+        self._dlbl.pack(side="left", padx=(4,0))
+        row+=1
+
+        ttk.Separator(f, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=6); row+=1
+
+        # ── LCD Type Configuration ────────────────────────────────────────────
+        self._build_lcd_config(f, row); row+=1
+
+        # (Start/Stop buttons are in the fixed bottom bar built by _build_dashboard)
+
+    # ── LCD TYPE CONFIGURATION SECTION ───────────────────────────────────────
+    def _build_lcd_config(self, parent, start_row):
+        """Builds the LCD Types section inside the settings frame."""
+        # Header row: title + Identify button on the right
+        hdr = tk.Frame(parent, bg=BG2)
+        hdr.grid(row=start_row, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,4))
+        tk.Label(hdr, text="LCD Display Types", bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._ident_btn = tk.Button(
+            hdr, text="⊙  Identify Screens",
+            bg=BG3, fg=TEXT_DIM,
+            font=("Segoe UI", 8), relief="flat", padx=8, pady=2,
+            cursor="hand2", command=self._identify_screens)
+        self._ident_btn.pack(side="right")
+
+        # Container frame that holds the dynamic per-LCD rows
+        container = tk.Frame(parent, bg=BG2)
+        container.grid(row=start_row, column=0, columnspan=2,
+                        sticky="ew", padx=10, pady=(26,0))
+        container.columnconfigure(0, weight=1)
+        self._lcd_hint_lbl = None
+
+        # The inner frame where per-LCD rows will be added
+        self._lcd_cfg_inner = tk.Frame(container, bg=BG2)
+        self._lcd_cfg_inner.pack(fill="x")
+
+    def _add_lcd_row(self, addr: str):
+        """Add a new LCD type row for addr (e.g. '0x27') if not already present."""
+        addr = addr.upper()
+        if not addr.startswith("0X"):
+            addr = "0x" + addr
+        if addr in self._lcd_type_vars:
+            return  # already shown
+
+        # Default to 1602
+        var = tk.StringVar(value=self._lcd_types.get(addr, "1602"))
+        self._lcd_type_vars[addr] = var
+        self._lcd_types[addr] = var.get()
+        var.trace_add("write", lambda *_, a=addr, v=var: self._on_lcd_type_changed(a, v))
+
+        row_f = tk.Frame(self._lcd_cfg_inner, bg=BG3)
+        row_f.pack(fill="x", pady=1, padx=0)
+
+        # Address badge
+        tk.Label(row_f, text=addr, bg=BG3, fg=LCD_ON,
+                 font=("Consolas", 9, "bold"), width=6, anchor="w",
+                 padx=4).pack(side="left")
+
+        # Type selector
+        om = tk.OptionMenu(row_f, var, "1602", "2004")
+        om.config(bg=BG3, fg=TEXT, activebackground=BG2, activeforeground=ACCENT,
+                  relief="flat", font=("Segoe UI", 9), highlightthickness=0,
+                  indicatoron=True, bd=0)
+        om["menu"].config(bg=BG2, fg=TEXT, font=("Segoe UI", 9))
+        om.pack(side="left", padx=6)
+
+        # Type badge (updates when var changes)
+        badge = tk.Label(row_f, text="1602", bg=BG3, fg=ACCENT2,
+                          font=("Segoe UI", 8))
+        badge.pack(side="left")
+
+        def update_badge(*_, b=badge, v=var):
+            t = v.get()
+            b.config(text=t, fg=ACCENT if t == "2004" else ACCENT2)
+
+        var.trace_add("write", lambda *_, b=badge, v=var: update_badge())
+        update_badge()
+
+        # Remove button
+        def remove(a=addr, r=row_f):
+            self._lcd_type_vars.pop(a, None)
+            self._lcd_types.pop(a, None)
+            r.destroy()
+            if not self._lcd_type_vars and self._lcd_hint_lbl:
+                self._lcd_hint_lbl.pack(fill="x")
+
+        tk.Button(row_f, text="✕", bg=BG3, fg=TEXT_DIM,
+                  font=("Segoe UI", 8), relief="flat",
+                  command=remove).pack(side="right", padx=4)
+
+    def _on_lcd_type_changed(self, addr: str, var: tk.StringVar):
+        self._lcd_types[addr] = var.get()
+
+    def _clear_lcd_config(self):
+        for widget in self._lcd_cfg_inner.winfo_children():
+            widget.destroy()
+        self._lcd_type_vars.clear()
+        self._lcd_types.clear()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _cb(self, parent, label, row, default=True):
+        var = tk.BooleanVar(value=default)
+        tk.Checkbutton(parent, text=label, variable=var, bg=BG2, fg=TEXT,
+                        selectcolor=BG3, activebackground=BG2, activeforeground=TEXT,
+                        font=("Segoe UI",9), anchor="w", relief="flat", bd=0
+                        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=1)
+        return var
+
+    def _scan_ports(self):
+        """Return list of (device, label) tuples, sorted by port number.
+        label = "COM3 -- Arduino Nano (CH340)"  or just "COM3" if no description.
+        """
+        port_map = {}   # device -> description
+
+        # Method 1: pyserial -- best source, gives manufacturer descriptions
+        try:
+            import serial.tools.list_ports as lp
+            for p in lp.comports():
+                desc = p.description or ""
+                # p.description already contains the port name sometimes, strip it
+                if desc.lower().startswith(p.device.lower()):
+                    desc = desc[len(p.device):].strip(" -()")
+                port_map[p.device] = desc
+        except Exception:
+            pass
+
+        # Method 2: Windows registry (port names only, no descriptions)
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DEVICEMAP\SERIALCOMM")
+            i = 0
+            while True:
+                try:
+                    _, val, _ = winreg.EnumValue(key, i)
+                    if val not in port_map:
+                        port_map[val] = ""
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+        # Method 3: brute-force probe COM1-COM32 (last resort)
+        if not port_map:
+            try:
+                import serial
+                for n in range(1, 33):
+                    name = f"COM{n}"
+                    try:
+                        s = serial.Serial(name); s.close()
+                        port_map[name] = ""
+                    except serial.SerialException as e:
+                        if "access" in str(e).lower() or "denied" in str(e).lower():
+                            port_map[name] = ""
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        def sort_key(dev):
+            num = dev[3:] if dev.upper().startswith("COM") else dev
+            return int(num) if num.isdigit() else 999
+
+        result = []
+        for dev in sorted(port_map.keys(), key=sort_key):
+            desc = port_map[dev].strip()
+            label = f"{dev} -- {desc}" if desc and desc != dev else dev
+            result.append((dev, label))
+        return result
+
+    def _refresh_ports(self):
+        """Scan available COM ports and update the dropdown."""
+        entries = self._scan_ports()   # list of (device, label)
+        # Store device->label mapping so we can extract the raw port on connect
+        self._port_labels = {dev: label for dev, label in entries}
+
+        labels  = [label for _, label  in entries]
+        devices = [dev   for dev, _    in entries]
+
+        self._port_cb["values"] = labels
+
+        def safe_log(msg):
+            try: self._append_log(msg)
+            except Exception: pass
+
+        # Figure out current raw device (might be "COM3" or full label)
+        current_raw = self._port_var.get().strip()
+        # Strip label back to raw port if needed
+        for dev, lbl in entries:
+            if current_raw == lbl:
+                current_raw = dev
+                break
+
+        if entries:
+            if self._default_port and self._default_port in devices:
+                # Pinned boot port wins whenever it's connected.
+                self._port_var.set(self._port_labels[self._default_port])
+            elif current_raw in devices:
+                # Refresh the display label in case it changed
+                self._port_var.set(self._port_labels[current_raw])
+            else:
+                # Auto-select: prefer USB/Arduino ports over built-in COM ports
+                usb_keywords = ("usb", "arduino", "ch340", "ch341",
+                                "ftdi", "cp210", "cp2102", "serial device")
+                preferred = next(
+                    (lbl for dev, lbl in entries
+                     if any(k in lbl.lower() for k in usb_keywords)),
+                    labels[0])  # fallback to first if none match
+                self._port_var.set(preferred)
+                if self._default_port:
+                    safe_log(f"[WARN] Pinned boot port {self._default_port} "
+                             f"not connected -- auto-selected instead.")
+
+            safe_log(f"[INFO] COM ports found:")
+            for dev, lbl in entries:
+                marker = " ◄ selected" if self._port_var.get() == lbl else ""
+                safe_log(f"[INFO]   {lbl}{marker}")
+        else:
+            safe_log("[WARN] No COM ports found -- is the Arduino plugged in?")
+
+    def _update_pin_label(self):
+        """Reflect the pinned-port state in the checkbox text/colour."""
+        if not hasattr(self, "_pin_cb"):
+            return
+        if self._default_port:
+            self._pin_cb.config(
+                text=f"  📌 Boot default: {self._default_port}", fg=ACCENT)
+        else:
+            self._pin_cb.config(
+                text="  📌 Pin selected port as boot default", fg=TEXT_DIM)
+
+    def _toggle_pin_port(self):
+        """Pin/unpin the currently selected port as the boot default."""
+        if self._pin_port_var.get():
+            self._default_port = self._get_selected_port()
+            self._append_log(f"[INFO] Boot default port pinned: {self._default_port}")
+        else:
+            self._default_port = None
+            self._append_log("[INFO] Boot default port unpinned (auto-detect).")
+        self._update_pin_label()
+        self._save_settings()
+
+    def _on_port_selected(self, event=None):
+        """User picked a port from the dropdown -- follow it while pinned."""
+        if self._pin_port_var.get():
+            self._default_port = self._get_selected_port()
+            self._update_pin_label()
+            self._save_settings()
+
+    def _get_selected_port(self):
+        """Return the raw COM port device name from current dropdown selection."""
+        label = self._port_var.get().strip()
+        # Exact match in label map
+        for dev, lbl in getattr(self, "_port_labels", {}).items():
+            if lbl == label:
+                return dev
+        # Fallback: if it looks like COMx already, use it directly
+        if label.upper().startswith("COM"):
+            return label.split(" ")[0]
+        return label
+
+    def _browse_dll(self):
+        p = filedialog.askopenfilename(
+            title="Select LibreHardwareMonitorLib.dll",
+            filetypes=[("DLL files","*.dll"),("All","*.*")])
+        if p: self._lhm_var.set(p)
+
+    def _browse_lhm_dest(self):
+        from tkinter import filedialog as fd
+        p = fd.askdirectory(title="Choose install folder for LibreHardwareMonitor")
+        if p: self._lhm_dest_var.set(p)
+
+    def _check_dll(self):
+        """Check if the DLL exists at the current path and update the status label."""
+        path = self._lhm_var.get().strip()
+        if not path:
+            self._dll_status_var.set("⚠  No path set")
+            self._dll_status_lbl.config(fg=YELLOW)
+        elif os.path.isfile(path):
+            size_kb = os.path.getsize(path) // 1024
+            self._dll_status_var.set(f"✓  Found  ({size_kb} KB)  --  {path}")
+            self._dll_status_lbl.config(fg=GREEN)
+            # Also pre-fill the downloader destination to match
+            self._lhm_dest_var.set(os.path.dirname(path))
+        else:
+            self._dll_status_var.set(f"✗  Not found  --  {path}")
+            self._dll_status_lbl.config(fg=RED)
+
+    def _check_admin(self):
+        if _is_admin():
+            self._admin_lbl.config(
+                text="✓  Running as Administrator -- temperatures enabled",
+                fg=GREEN)
+        else:
+            self._admin_lbl.config(
+                text="⚠  Not Administrator -- temperatures will show N/A  (right-click -> Run as administrator)",
+                fg=YELLOW)
+
+    def _dl_set_status(self, msg, color=None):
+        """Thread-safe status update."""
+        def _update():
+            self._dl_status_var.set(msg)
+            if color:
+                self._dl_status_lbl.config(fg=color)
+        self.after(0, _update)
+
+    def _dl_set_progress(self, pct):
+        self.after(0, lambda: self._dl_progress.config(value=pct))
+
+    def _dl_set_btn(self, text, state, bg=None):
+        def _update():
+            self._dl_btn.config(text=text, state=state)
+            if bg: self._dl_btn.config(bg=bg)
+        self.after(0, _update)
+
+    def _start_lhm_download(self):
+        self._dl_btn.config(state="disabled", text="Downloading...")
+        self._dl_progress.config(value=0)
+        self._dl_set_status("Checking GitHub for latest release...", TEXT_DIM)
+        threading.Thread(target=self._download_lhm_worker, daemon=True).start()
+
+    def _download_lhm_worker(self):
+        import ssl
+        ctx = ssl.create_default_context()
+        dest_dir = self._lhm_dest_var.get().strip()
+
+        try:
+            # ── Step 1: resolve latest release via GitHub API ─────────────────
+            self._dl_set_status("Querying GitHub API...")
+            api_url = "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+            with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                release = _json.loads(resp.read().decode())
+
+            tag  = release.get("tag_name", "?")
+            assets = release.get("assets", [])
+            zip_url = None
+            for a in assets:
+                name = a.get("name","").lower()
+                if name.endswith(".zip") and "libre" in name:
+                    zip_url = a["browser_download_url"]; break
+            # Fallback: find any zip asset
+            if not zip_url:
+                for a in assets:
+                    if a.get("name","").lower().endswith(".zip"):
+                        zip_url = a["browser_download_url"]; break
+
+            if not zip_url:
+                self._dl_set_status(f"✗ No zip found in release {tag}", RED)
+                self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
+                return
+
+            self._dl_set_status(f"Downloading {tag}...")
+            self._dl_set_progress(5)
+
+            # ── Step 2: download zip with progress ────────────────────────────
+            req2 = urllib.request.Request(zip_url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+            with urllib.request.urlopen(req2, context=ctx, timeout=60) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                buf = io.BytesIO()
+                downloaded = 0
+                chunk = 8192
+                while True:
+                    data = resp.read(chunk)
+                    if not data: break
+                    buf.write(data)
+                    downloaded += len(data)
+                    if total > 0:
+                        pct = 5 + int(downloaded / total * 80)
+                        self._dl_set_progress(pct)
+                        self._dl_set_status(
+                            f"Downloading {tag}... {downloaded//1024} / {total//1024} KB")
+
+            self._dl_set_status("Extracting..."); self._dl_set_progress(88)
+
+            # ── Step 3: extract just the DLL ─────────────────────────────────
+            os.makedirs(dest_dir, exist_ok=True)
+            buf.seek(0)
+            dll_name = "LibreHardwareMonitorLib.dll"
+            found_dll = False
+            with zipfile.ZipFile(buf) as zf:
+                for member in zf.namelist():
+                    bname = os.path.basename(member)
+                    if not bname or not bname.lower().endswith(".dll"):
+                        continue
+                    data = zf.read(member)
+                    out_path = os.path.join(dest_dir, bname)
+                    with open(out_path, "wb") as fout:
+                        fout.write(data)
+                    if bname.lower() == dll_name.lower():
+                        found_dll = True
+                    else:
+                        self._append_log(f"[OK] Also extracted: {bname}")
+
+            if not found_dll:
+                self._dl_set_status("✗ DLL not found inside zip", RED)
+                self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
+                return
+
+            # ── Step 4: update the DLL path field ─────────────────────────────
+            dll_path = os.path.join(dest_dir, dll_name)
+            self.after(0, lambda p=dll_path: self._lhm_var.set(p))
+            self.after(50, self._check_dll)
+            self._dl_set_progress(100)
+            self._dl_set_status(f"✓ Installed {tag}  ->  {dll_path}", GREEN)
+            self._dl_set_btn("✓  Installed -- click to re-download", "normal", GREEN)
+            self._append_log(f"[OK] LHM {tag} installed to {dll_path}")
+
+        except urllib.error.URLError as e:
+            self._dl_set_status(f"✗ Network error: {e.reason}", RED)
+            self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
+        except Exception as e:
+            self._dl_set_status(f"✗ Error: {e}", RED)
+            self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
+
+    # ── STATS PANEL ───────────────────────────────────────────────────────────
+    def _build_stats(self, parent):
+        f = tk.LabelFrame(parent, text=" Live Stats ", bg=BG2, fg=ACCENT,
+                          font=("Segoe UI",10,"bold"), bd=0, relief="flat",
+                          highlightbackground=BORDER, highlightthickness=1)
+        f.grid(row=0, column=1, sticky="nsew", pady=(6,3))
+
+        def section(t):
+            tk.Label(f, text=f"  {t}", bg=BG2, fg=ACCENT2,
+                     font=("Segoe UI",9,"bold")).pack(fill="x", pady=(8,2))
+        def temp_row(lbl):
+            rf = tk.Frame(f, bg=BG2); rf.pack(fill="x", padx=8)
+            tk.Label(rf, text=lbl, bg=BG2, fg=TEXT_DIM, font=("Consolas",9),
+                     width=14, anchor="e").pack(side="left")
+            lb = TempLabel(rf, text="", bg=BG2, fg=TEXT_DIM, font=("Consolas",10))
+            lb.pack(side="left"); return lb
+        def info_row(lbl):
+            rf = tk.Frame(f, bg=BG2); rf.pack(fill="x", padx=8, pady=1)
+            tk.Label(rf, text=lbl, bg=BG2, fg=TEXT_DIM, font=("Consolas",9),
+                     width=14, anchor="e").pack(side="left")
+            lb = tk.Label(rf, text=" --", bg=BG2, fg=TEXT, font=("Consolas",10))
+            lb.pack(side="left"); return lb
+
+        section("CPU")
+        self._bar_cpu = StatBar(f, "CPU"); self._bar_cpu.pack(fill="x", padx=8, pady=1)
+        self._cpu_temp = temp_row("Temp")
+        section("GPU")
+        self._bar_gpu = StatBar(f, "GPU"); self._bar_gpu.pack(fill="x", padx=8, pady=1)
+        self._gpu_temp = temp_row("Temp")
+        self._vram = info_row("VRAM Used")
+        section("RAM")
+        self._bar_ram = StatBar(f, "RAM"); self._bar_ram.pack(fill="x", padx=8, pady=1)
+        self._ram_used = info_row("Used / Total")
+        section("Network")
+        self._bar_dl = StatBar(f, "DL"); self._bar_dl.pack(fill="x", padx=8, pady=1)
+        self._bar_ul = StatBar(f, "UL"); self._bar_ul.pack(fill="x", padx=8, pady=1)
+        self._link   = info_row("Link Speed")
+        tk.Frame(f, bg=BG2, height=8).pack()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  TAB 2 -- LCD PAGE ORDER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _identify_screens(self):
+        """Send IDENT command - Arduino flashes each screen with its number."""
+        if not self._running or not self._thread:
+            self._append_log("[WARN] Connect first, then use Identify")
+            return
+        # The monitor thread polls this flag and injects an IDENT frame.
+        self._thread._app_ident_pending = True
+        self._ident_btn.config(text="⊙  Identifying...", fg=YELLOW)
+        self.after(3500, lambda: self._ident_btn.config(
+            text="⊙  Identify Screens", fg=TEXT_DIM))
+
+    def _rebuild_order_rows(self):
+        """Rebuild the page-order rows inside the settings panel."""
+        for w in self._order_frame.winfo_children():
+            w.destroy()
+
+        desc = {
+            "CPU": "CPU usage + temperature",
+            "GPU": "GPU usage + VRAM + temperature",
+            "RAM": "RAM usage + used / total",
+            "NET": "Download / Upload speeds",
+        }
+
+        for idx, (pid, name, enabled_var) in enumerate(self._page_order):
+            enabled = enabled_var.get()
+            row_bg  = BG2 if enabled else BG3
+
+            row_f = tk.Frame(self._order_frame, bg=row_bg,
+                             highlightbackground=BORDER, highlightthickness=1)
+            row_f.pack(fill="x", pady=2)
+            row_f.columnconfigure(2, weight=1)
+
+            # Enable checkbox
+            cb = tk.Checkbutton(row_f, variable=enabled_var, bg=row_bg,
+                                activebackground=row_bg, relief="flat", bd=0,
+                                command=self._rebuild_order_rows)
+            cb.grid(row=0, column=0, padx=(6, 0))
+
+            # Screen label (only for enabled rows)
+            enabled_count = sum(1 for _, _, v in self._page_order[:idx] if v.get()) + (1 if enabled else 0)
+            screen_txt = f"Screen {enabled_count}" if enabled else "disabled"
+            screen_fg  = TEXT_DIM if enabled else BORDER
+            tk.Label(row_f, text=screen_txt, bg=row_bg, fg=screen_fg,
+                     font=("Segoe UI", 8), width=9, anchor="center"
+                     ).grid(row=0, column=1, padx=4, pady=6)
+
+            # Page colour badge + description
+            color = self._page_colors.get(name, TEXT) if enabled else TEXT_DIM
+            badge_fg = "#1a1b26" if enabled else BG3
+            info_f = tk.Frame(row_f, bg=row_bg)
+            info_f.grid(row=0, column=2, sticky="ew", padx=4, pady=5)
+            tk.Label(info_f, text=f"  {name}  ",
+                     bg=color, fg=badge_fg,
+                     font=("Segoe UI", 9, "bold"), padx=3, pady=2
+                     ).pack(side="left")
+            tk.Label(info_f, text=f"  {desc.get(name, '')}",
+                     bg=row_bg, fg=screen_fg,
+                     font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+
+            # ▲ ▼ buttons
+            btn_f = tk.Frame(row_f, bg=row_bg)
+            btn_f.grid(row=0, column=3, padx=(4, 6))
+            tk.Button(btn_f, text="▲", bg=BG3,
+                      fg=TEXT_DIM if idx > 0 else BORDER,
+                      font=("Segoe UI", 7), relief="flat", width=2, pady=1,
+                      state="normal" if idx > 0 else "disabled",
+                      command=lambda i=idx: self._move_page(i, -1)
+                      ).pack(pady=(0, 1))
+            tk.Button(btn_f, text="▼", bg=BG3,
+                      fg=TEXT_DIM if idx < len(self._page_order)-1 else BORDER,
+                      font=("Segoe UI", 7), relief="flat", width=2, pady=1,
+                      state="normal" if idx < len(self._page_order)-1 else "disabled",
+                      command=lambda i=idx: self._move_page(i, 1)
+                      ).pack()
+
+    def _move_page(self, idx, direction):
+        other = idx + direction
+        if 0 <= other < len(self._page_order):
+            self._page_order[idx], self._page_order[other] = self._page_order[other], self._page_order[idx]
+            self._rebuild_order_rows()
+
+    def get_page_order(self):
+        """Return ordered list of enabled page IDs e.g. [2, 1, 0]"""
+        return [pid for pid, _, v in self._page_order if v.get()]
+
+    # ── BRANDING FOOTER ──────────────────────────────────────────────────────
+    def _build_footer(self):
+        footer = tk.Frame(self, bg=BG3, pady=4)
+        footer.pack(fill="x", side="bottom", padx=0)
+
+        # Left: logo text + version
+        left = tk.Frame(footer, bg=BG3)
+        left.pack(side="left", padx=12)
+        tk.Label(left, text="⬡ ROZAKOS INDUSTRIES",
+                 bg=BG3, fg="#9e1a1a",
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+        tk.Label(left, text=f"  v{APP_VERSION}",
+                 bg=BG3, fg=TEXT_DIM,
+                 font=("Segoe UI", 7)).pack(side="left")
+
+        # Right: website + email
+        right = tk.Frame(footer, bg=BG3)
+        right.pack(side="right", padx=12)
+
+        def link_btn(text, url_or_mail, is_mail=False):
+            import webbrowser
+            lbl = tk.Label(right, text=text, bg=BG3, fg=ACCENT2,
+                           font=("Segoe UI", 8, "underline"), cursor="hand2")
+            lbl.pack(side="right", padx=(8,0))
+            target = ("mailto:" + url_or_mail) if is_mail else url_or_mail
+            lbl.bind("<Button-1>", lambda e: webbrowser.open(target))
+            lbl.bind("<Enter>", lambda e: lbl.config(fg=ACCENT))
+            lbl.bind("<Leave>", lambda e: lbl.config(fg=ACCENT2))
+
+        link_btn(BRAND_EMAIL, BRAND_EMAIL, is_mail=True)
+        tk.Label(right, text="·", bg=BG3, fg=TEXT_DIM,
+                 font=("Segoe UI", 8)).pack(side="right", padx=2)
+        link_btn(BRAND_URL, BRAND_URL)
+
+    # ── LOG PANEL (dashboard right column, bottom) ───────────────────────────
+    def _build_log(self, parent):
+        f = tk.LabelFrame(parent, text=" Log ", bg=BG2, fg=ACCENT,
+                          font=("Segoe UI",10,"bold"), bd=0, relief="flat",
+                          highlightbackground=BORDER, highlightthickness=1)
+        f.grid(row=1, column=1, sticky="nsew", pady=(0,6))
+        f.rowconfigure(1, weight=1); f.columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(f, bg=BG2); hdr.grid(row=0, column=0, sticky="ew", padx=6, pady=(4,0))
+        tk.Button(hdr, text="Clear", bg=BG3, fg=TEXT_DIM,
+                  font=("Segoe UI",8), relief="flat", padx=8,
+                  command=self._clear_log).pack(side="right")
+
+        self._log = scrolledtext.ScrolledText(
+            f, bg=BG, fg=TEXT, font=("Consolas",8),
+            insertbackground=TEXT, relief="flat", state="disabled", wrap="word")
+        self._log.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2,6))
+        self._log.tag_config("err",  foreground=RED)
+        self._log.tag_config("ok",   foreground=GREEN)
+        self._log.tag_config("info", foreground=ACCENT)
+        self._log.tag_config("tx",   foreground=TEXT_DIM)
+
+    def _clear_log(self):
+        self._log.config(state="normal"); self._log.delete("1.0","end")
+        self._log.config(state="disabled")
+
+    def _append_log(self, msg):
+        tag = "tx"
+        ml = msg.lower()
+        if "[error]" in ml:  tag = "err"
+        elif "[ok]" in ml:   tag = "ok"
+        elif "[info]" in ml or "[warn]" in ml: tag = "info"
+        self._log.config(state="normal")
+        self._log.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n", tag)
+        self._log.see("end"); self._log.config(state="disabled")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SYSTEM TRAY
+    # ══════════════════════════════════════════════════════════════════════════
+    def _make_tray_image(self):
+        """Use the Rozakos robot logo as tray icon."""
+        try:
+            import base64, io
+            data = base64.b64decode(_ROBOT_B64)
+            return Image.open(io.BytesIO(data)).convert("RGBA").resize((64,64))
+        except Exception:
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            ImageDraw.Draw(img).ellipse([4,4,60,60], fill="#9e1a1a")
+            return img
+
+    # ── SETTINGS PERSISTENCE ─────────────────────────────────────────────────
+    _PAGE_NAMES = {0: "CPU", 1: "GPU", 2: "RAM", 3: "NET"}
+
+    def _collect_settings(self) -> dict:
+        """Snapshot the current UI configuration into a JSON-serialisable dict."""
+        return {
+            "port":         self._get_selected_port(),
+            "default_port": self._default_port,
+            "baud":       self._baud_var.get().strip(),
+            "lhm_path":   self._lhm_var.get().strip(),
+            "lhm_dest":   self._lhm_dest_var.get().strip(),
+            "page_delay": self._delay_var.get(),
+            "page_order": [[pid, bool(v.get())] for pid, _, v in self._page_order],
+            "lcd_types":  dict(self._lcd_types),
+        }
+
+    def _save_settings(self):
+        try:
+            save_settings(self._collect_settings())
+        except Exception:
+            pass
+
+    def _apply_settings(self, d: dict):
+        """Apply a saved settings dict to the UI widgets."""
+        if not d:
+            return
+        try:
+            if d.get("default_port"):
+                self._default_port = d["default_port"]
+                self._pin_port_var.set(True)
+                self._update_pin_label()
+            if d.get("baud"):
+                self._baud_var.set(str(d["baud"]))
+            if d.get("lhm_path"):
+                self._lhm_var.set(d["lhm_path"])
+            if d.get("lhm_dest"):
+                self._lhm_dest_var.set(d["lhm_dest"])
+            if "page_delay" in d:
+                self._delay_var.set(int(d["page_delay"]))
+                self._dlbl.config(text=f"{self._delay_var.get()/1000:.1f} s")
+            if d.get("port"):
+                # _refresh_ports (scheduled shortly after) maps this to a label
+                # and keeps it selected if the device is present.
+                self._port_var.set(d["port"])
+
+            # Page order + enabled flags (preserve saved order)
+            po = d.get("page_order")
+            if po:
+                rebuilt, seen = [], set()
+                for item in po:
+                    try:
+                        pid, en = int(item[0]), bool(item[1])
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                    if pid in self._PAGE_NAMES and pid not in seen:
+                        rebuilt.append(
+                            (pid, self._PAGE_NAMES[pid], tk.BooleanVar(value=en)))
+                        seen.add(pid)
+                # Keep any pages missing from the saved order (their current vars)
+                for pid, name, var in self._page_order:
+                    if pid not in seen:
+                        rebuilt.append((pid, name, var))
+                if rebuilt:
+                    self._page_order = rebuilt
+                    self._rebuild_order_rows()
+
+            # LCD types -- pre-populate rows so types are remembered before connect
+            for addr, t in (d.get("lcd_types") or {}).items():
+                self._add_lcd_row(addr)
+                key = addr.upper()
+                if not key.startswith("0X"):
+                    key = "0X" + key
+                if key in self._lcd_type_vars and t in ("1602", "2004"):
+                    self._lcd_type_vars[key].set(t)
+        except Exception as e:
+            self._append_log(f"[WARN] Could not apply saved settings: {e}")
+
+    def _autostart_monitor(self):
+        """Begin monitoring automatically (used for boot launches)."""
+        if not self._running:
+            self._append_log("[INFO] Auto-starting monitor (boot launch)...")
+            self._start()
+
+    def _toggle_startup(self):
+        """Enable/disable the logon scheduled task to match the checkbox."""
+        want = self._startup_var.get()
+        ok, msg = _enable_startup() if want else _disable_startup()
+        self._append_log(msg)
+        if not ok:
+            # Revert the checkbox so it reflects the real state.
+            self._startup_var.set(not want)
+            if not _is_admin():
+                self._append_log(
+                    "[INFO] Administrator rights are required to change "
+                    "start-on-boot.")
+
+    def _on_close(self):
+        """Minimise to tray instead of quitting."""
+        self._save_settings()
+        if TRAY_OK:
+            self.withdraw()   # hide window + taskbar entry
+            self._start_tray()
+        else:
+            self._quit_app()
+
+    def _start_tray(self):
+        if self._tray_icon is not None:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem("Restore", self._restore_from_tray, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit",    self._quit_app),
+        )
+        self._tray_icon = pystray.Icon(
+            "PCMonitor", self._make_tray_image(),
+            "PC Monitor Sender", menu)
+        import threading
+        self._tray_thread = threading.Thread(
+            target=self._tray_icon.run, daemon=True)
+        self._tray_thread.start()
+
+    def _restore_from_tray(self, icon=None, item=None):
+        if self._tray_icon:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self.after(0, self._do_restore)
+
+    def _do_restore(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _quit_app(self, icon=None, item=None):
+        self._save_settings()
+        if self._tray_icon:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self._stop_event.set()
+        self.after(0, self.destroy)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  START / STOP / POLL
+    # ══════════════════════════════════════════════════════════════════════════
+    def _start(self):
+        if self._running: return
+        self._save_settings()   # remember this configuration for next launch
+        self._stop_event.clear()
+        cfg = {
+            "port":       self._get_selected_port(),
+            "baud":       int(self._baud_var.get().strip()),
+            "lhm_path":   self._lhm_var.get().strip(),
+            "page_delay": self._delay_var.get(),
+            "lcd_types":  dict(self._lcd_types),
+            "page_order": self.get_page_order(),
+        }
+        self._thread = MonitorThread(cfg, self._log_q, self._stats_q,
+                                     self._lcd_q, self._stop_event)
+        self._thread.start()
+        self._running = True
+        self._start_btn.config(state="disabled", bg=BG3, fg=TEXT_DIM)
+        self._stop_btn.config(state="normal",    bg=RED, fg="#1a1b26")
+        self._status_dot.config(fg=GREEN)
+        self._status_lbl.config(text="Running", fg=GREEN)
+
+    def _stop(self):
+        if not self._running: return
+        self._stop_event.set(); self._running = False
+        self._start_btn.config(state="normal",  bg=GREEN,    fg="#1a1b26")
+        self._stop_btn.config(state="disabled", bg=BG3,      fg=TEXT_DIM)
+        self._status_dot.config(fg=TEXT_DIM)
+        self._status_lbl.config(text="Stopped", fg=TEXT_DIM)
+
+    def _poll(self):
+        # Drain log
+        try:
+            while True: self._append_log(self._log_q.get_nowait())
+        except queue.Empty: pass
+
+        # Drain discovered LCD addresses
+        try:
+            while True:
+                addr = self._lcd_q.get_nowait()
+                self._add_lcd_row(addr)
+        except queue.Empty: pass
+
+        # Drain stats
+        latest = None
+        try:
+            while True: latest = self._stats_q.get_nowait()
+        except queue.Empty: pass
+        if latest:
+            self._latest_stats.update(latest)
+            self._update_dashboard(latest)
+
+        if self._running and self._thread and not self._thread.is_alive():
+            self._stop()
+
+        self.after(500, self._poll)
+
+    def _update_dashboard(self, s):
+        self._bar_cpu.set(s["cpu"],  f"{s['cpu']:5.1f}%"); self._cpu_temp.set(s["cpu_temp"])
+        self._bar_gpu.set(s["gpu"],  f"{s['gpu']:5.1f}%"); self._gpu_temp.set(s["gpu_temp"])
+        vm = s["vram_mb"]; vt = s.get("vram_total_mb", -1)
+        if vm >= 0 and vt > 0:
+            self._vram.config(text=f" {vm} / {vt} MB")
+        elif vm >= 0:
+            self._vram.config(text=f" {vm} MB")
+        else:
+            self._vram.config(text="")
+        self._bar_ram.set(s["ram"],  f"{s['ram']:5.1f}%")
+        self._ram_used.config(text=f" {s['ram_mb']} / {int(s['ram_total_mb'])} MB")
+        ls_kb = s["link_speed"] * 1000 / 8
+        def fmt_speed(kb):
+            if kb >= 1024: return f"{kb/1024:>5.1f} MB/s"
+            return       f"{kb:>5.0f} KB/s"
+        self._bar_dl.set(min(100, s["dl_kb"]/ls_kb*100) if ls_kb else 0, fmt_speed(s["dl_kb"]))
+        self._bar_ul.set(min(100, s["ul_kb"]/ls_kb*100) if ls_kb else 0, fmt_speed(s["ul_kb"]))
+        self._link.config(text=f" {s['link_speed']} Mbps")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    # CPU/GPU temperatures require Administrator rights (LHM loads a ring0 driver).
+    # If not elevated, relaunch via UAC and exit this unelevated instance.
+    # The sentinel guarantees we attempt this at most once -- if the elevated
+    # instance still isn't detected as admin, we run anyway instead of looping.
+    _already_relaunched = _ELEVATED_FLAG in _sys.argv
+    if not _is_admin() and not _already_relaunched:
+        if _relaunch_as_admin():
+            _sys.exit(0)
+        # Elevation declined or failed -- continue unelevated; temps will show N/A.
+    App().mainloop()
