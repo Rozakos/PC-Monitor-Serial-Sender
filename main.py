@@ -40,7 +40,7 @@ except ImportError:
     _pn_runtime = "not_installed"
 
 # Rozakos Industries branding
-APP_VERSION   = "1.0.0"
+APP_VERSION   = "1.0.1"
 BRAND_NAME    = "Rozakos Industries"
 BRAND_URL     = "https://rozakos.com"
 BRAND_EMAIL   = "info@rozakos.com"
