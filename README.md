@@ -65,8 +65,8 @@ From source:
 python main.py
 ```
 
-Or build a standalone EXE with PyInstaller and run that. The app stores its
-settings at `~/.pcmonitor_sender.json`.
+Or build a standalone EXE (see [Building an EXE](#building-an-exe)) and run that.
+The app stores its settings at `~/.pcmonitor_sender.json`.
 
 ### Quick start
 
@@ -79,6 +79,40 @@ settings at `~/.pcmonitor_sender.json`.
    `1602` or `2004` as appropriate.
 
 ---
+
+## Building an EXE
+
+No installer is required — the app builds into a single self-contained `.exe`.
+LibreHardwareMonitor is downloaded at runtime and settings live in your user
+profile, so nothing else needs bundling.
+
+The simplest way:
+
+```powershell
+.\build.ps1
+```
+
+This installs PyInstaller if needed and builds from `PC-Monitor-Sender.spec`,
+producing `dist\PC-Monitor-Sender.exe`. Use `.\build.ps1 -Clean` to wipe
+`build\` and `dist\` first.
+
+Equivalent manual command:
+
+```powershell
+pyinstaller PC-Monitor-Sender.spec
+```
+
+The spec produces a **windowed** (no console) one-file EXE with `icon.ico`
+embedded and bundled, and pins the dynamic imports (`pystray`, `PIL`,
+`pyserial`, `pythonnet`/`clr`) so they aren't missed.
+
+Notes:
+
+- The app **self-elevates via UAC at runtime**, so the EXE doesn't need an
+  admin manifest.
+- One-file EXEs unpack to a temp dir on launch, so first start is a little
+  slower. Bare PyInstaller EXEs can also trip SmartScreen/AV false positives —
+  code-signing resolves that.
 
 ## Serial protocol
 

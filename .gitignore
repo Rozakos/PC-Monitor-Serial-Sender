@@ -9,10 +9,9 @@ __pycache__/
 .venv/
 venv/
 
-# PyInstaller build output
+# PyInstaller build output (the hand-maintained PC-Monitor-Sender.spec is kept)
 build/
 dist/
-*.spec
 
 # App-downloaded native deps
 LibreHardwareMonitor/

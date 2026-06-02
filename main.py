@@ -70,7 +70,14 @@ if getattr(_sys, 'frozen', False):
 else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-BRAND_ICO = os.path.join(_APP_DIR, "icon.ico")
+# Bundled read-only resources (e.g. icon.ico) live next to the EXE for a normal
+# run, but in a PyInstaller --onefile build they're unpacked to sys._MEIPASS.
+# _APP_DIR must stay the real EXE dir (LHM download / UAC working dir depend on
+# it), so resolve bundled assets separately: prefer _MEIPASS, fall back to disk.
+_BUNDLE_DIR = getattr(_sys, "_MEIPASS", _APP_DIR)
+BRAND_ICO = os.path.join(_BUNDLE_DIR, "icon.ico")
+if not os.path.isfile(BRAND_ICO):
+    BRAND_ICO = os.path.join(_APP_DIR, "icon.ico")
 
 try:
     import serial;  SERIAL_OK = True
