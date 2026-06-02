@@ -1,0 +1,6 @@
+# PC Monitor Serial Sender runtime dependencies
+psutil        # CPU / RAM / network stats
+pyserial      # serial communication with the Arduino
+pystray       # system-tray icon
+pillow        # splash/tray imaging (embedded logo); without it the splash falls back to text
+pythonnet     # .NET bridge to LibreHardwareMonitor for CPU/GPU temperatures
