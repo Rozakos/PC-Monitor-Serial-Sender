@@ -31,6 +31,16 @@ standalone Windows EXE (PyInstaller-compatible). Branded as *Rozakos Industries*
 
 ---
 
+## Download
+
+Prebuilt Windows binary (no install needed):
+
+**[Download PC-Monitor-Sender.exe](https://github.com/Rozakos/PC-Monitor-Serial-Sender/releases/latest)** — from the latest release.
+
+Run it as administrator (the app self-elevates) so CPU/GPU temperatures work;
+LibreHardwareMonitor is downloaded automatically on first run. Prefer to build
+it yourself? See [Building an EXE](#building-an-exe).
+
 ## Requirements
 
 - Windows 10 / 11
