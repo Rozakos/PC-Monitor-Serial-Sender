@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-PC Monitor Sender -- Tkinter GUI  v3
-Mixed 1602/2004 LCD support, runtime-configured. Standalone EXE compatible.
+PC Monitor Sender -- Tkinter GUI
+Streams live PC stats to the Arduino LCD monitor. Standalone EXE compatible.
 """
 
 import time
@@ -19,7 +19,7 @@ try:
     import pystray
     from PIL import Image, ImageDraw
     TRAY_OK = True
-except ImportError:
+except Exception:   # ImportError, or a pystray backend that can't load
     TRAY_OK = False
 
 # pythonnet 3.x: select runtime BEFORE any 'import clr'
@@ -40,7 +40,7 @@ except ImportError:
     _pn_runtime = "not_installed"
 
 # Rozakos Industries branding
-APP_VERSION   = "1.0.1"
+APP_VERSION   = "1.1.0"
 BRAND_NAME    = "Rozakos Industries"
 BRAND_URL     = "https://rozakos.com"
 BRAND_EMAIL   = "info@rozakos.com"
@@ -776,37 +776,6 @@ def get_gpu_temp():
         _temp_debug_done = True
         return -1.0
 
-def get_gpu_usage_intel():
-    try:
-        cmd = ["typeperf", "\\GPU Engine(*)\\Utilization Percentage", "-sc", "1"]
-        out = subprocess.check_output(cmd, timeout=5, stderr=subprocess.DEVNULL,
-                                      creationflags=_NO_WINDOW).decode(errors="ignore")
-        for l in out.strip().splitlines():
-            l = l.strip()
-            if l.startswith('"') and ',' in l and "GPU Engine" not in l:
-                vals = [float(v) for v in re.findall(r'[\d]+\.[\d]+', l) if float(v) < 200]
-                return min(sum(vals), 100.0) if vals else 0.0
-        return 0.0
-    except Exception: return 0.0
-
-def get_gpu_vram_mb():
-    global _vram_failures
-    if _vram_failures >= _VRAM_MAX_FAIL: return -1
-    try:
-        cmd = ["typeperf", "\\GPU Process Memory(*)\\Dedicated Usage", "-sc", "1"]
-        out = subprocess.check_output(cmd, timeout=5, stderr=subprocess.DEVNULL,
-                                      creationflags=_NO_WINDOW).decode(errors="ignore")
-        for l in out.strip().splitlines():
-            l = l.strip()
-            if l.startswith('"') and ',' in l and "GPU Process Memory" not in l:
-                vals = [float(v) for v in re.findall(r'[\d]+\.[\d]+', l)]
-                if vals:
-                    mb = int(sum(vals) / (1024 * 1024))
-                    if mb > 0: _vram_failures = 0; return mb
-        _vram_failures += 1; return -1
-    except Exception:
-        _vram_failures += 1; return -1
-
 def get_gpu_vram_total_mb(log_fn=print):
     """Get total GPU VRAM in MB. Tries LHM first, then nvidia-smi."""
     # Method 1: LibreHardwareMonitor
@@ -930,10 +899,98 @@ class NetSpeed:
         self.prev_recv = c.bytes_recv; self.prev_sent = c.bytes_sent; self.prev_time = now
         return int(round(dl)), int(round(ul))
 
-def wait_for_ready(ser, timeout_s=3.0, log_fn=print, lcd_fn=None):
+def _parse_typeperf_csv(out):
+    """Return [(counter_path, value)] from a one-sample `typeperf` CSV dump."""
+    import csv
+    rows = [r for r in csv.reader(io.StringIO(out)) if r]
+    header = next((r for r in rows if len(r) > 1 and r[1].startswith("\\\\")), None)
+    if header is None:
+        return []
+    values = next((r for r in rows[rows.index(header) + 1:] if len(r) == len(header)), None)
+    if values is None:
+        return []
+    pairs = []
+    for path, raw in zip(header[1:], values[1:]):
+        try:
+            pairs.append((path, float(raw)))
+        except ValueError:
+            pass
+    return pairs
+
+def _gpu_from_lhm():
+    """(load %, VRAM used MB) straight from LibreHardwareMonitor, -1 when unknown.
+
+    LHM reads the driver's own "GPU Core" load and "GPU Memory Used" sensors, which
+    match what NVIDIA/AMD tools report, so it is preferred over perf counters.
+    """
+    if not _lhm_available or _lhm_computer is None:
+        return -1.0, -1
+    try:
+        from LibreHardwareMonitor.Hardware import HardwareType, SensorType
+        gpu_types = [HardwareType.GpuNvidia, HardwareType.GpuAmd, HardwareType.GpuIntel]
+        for hw in _lhm_computer.Hardware:
+            if hw.HardwareType not in gpu_types:
+                continue
+            hw.Update()
+            load, used = -1.0, -1
+            for s in hw.Sensors:
+                if s.Value is None:
+                    continue
+                n = s.Name.lower()
+                if s.SensorType == SensorType.Load and n in ("gpu core", "d3d 3d") and load < 0:
+                    load = float(s.Value)
+                elif s.SensorType == SensorType.SmallData and "memory used" in n and "shared" not in n:
+                    used = int(s.Value)
+            if load >= 0 or used >= 0:
+                return load, used
+    except Exception:
+        pass
+    return -1.0, -1
+
+def get_gpu_counters():
+    """(GPU load %, dedicated VRAM used MB) from ONE typeperf call.
+
+    The old code ran typeperf twice per frame (~1 s each). Load follows Task
+    Manager: sum the engines of each engine type (3D, Copy, VideoDecode, ...)
+    and report the busiest type, instead of adding every engine together.
+    """
+    global _vram_failures
+    lhm_load, lhm_used = _gpu_from_lhm()
+    if lhm_load >= 0 and lhm_used >= 0:
+        return min(lhm_load, 100.0), lhm_used
+    counters = ["\\GPU Engine(*)\\Utilization Percentage"]
+    if _vram_failures < _VRAM_MAX_FAIL and lhm_used < 0:
+        counters.append("\\GPU Process Memory(*)\\Dedicated Usage")
+    try:
+        out = subprocess.check_output(["typeperf", *counters, "-sc", "1"], timeout=6,
+                                      stderr=subprocess.DEVNULL,
+                                      creationflags=_NO_WINDOW).decode(errors="ignore")
+    except Exception:
+        return (lhm_load if lhm_load >= 0 else 0.0), lhm_used
+    per_type, vram_bytes, saw_vram = {}, 0.0, False
+    for path, val in _parse_typeperf_csv(out):
+        p = path.lower()
+        if "gpu engine" in p:
+            m = re.search(r"engtype_([a-z0-9 ]+)", p)
+            key = m.group(1) if m else "all"
+            per_type[key] = per_type.get(key, 0.0) + val
+        elif "dedicated usage" in p:
+            vram_bytes += val; saw_vram = True
+    load = lhm_load if lhm_load >= 0 else min(max(per_type.values(), default=0.0), 100.0)
+    used = lhm_used
+    if used < 0 and len(counters) > 1:
+        if saw_vram and vram_bytes > 0:
+            used = int(vram_bytes / (1024 * 1024)); _vram_failures = 0
+        else:
+            _vram_failures += 1
+    return load, used
+
+def wait_for_ready(ser, timeout_s=3.0, log_fn=print, lcd_fn=None, stop_event=None):
     log_fn("Waiting for MCU READY...")
     end = time.time() + timeout_s
     while time.time() < end:
+        if stop_event is not None and stop_event.is_set():
+            return False
         line = ser.readline().decode(errors="ignore").strip()
         if line:
             log_fn(f"RX: {line}")
@@ -951,40 +1008,46 @@ def wait_for_ready(ser, timeout_s=3.0, log_fn=print, lcd_fn=None):
 #  MONITOR THREAD
 # ══════════════════════════════════════════════════════════════════════════════
 
+RECONNECT_DELAY_S = 3
+
 class MonitorThread(threading.Thread):
-    def __init__(self, cfg, log_q, stats_q, lcd_q, stop_event):
+    """Samples the sensors and streams one frame per second to the board.
+
+    Reports its state on status_q as (state, detail) where state is one of
+    connecting / waiting / running / reconnecting / error / stopped. When the
+    board is unplugged or the port vanishes it keeps retrying (auto_reconnect)
+    and keeps sampling, so the dashboard stays live while the board is away.
+    `flags` is a dict shared with the GUI: verbose (log raw frames) and ident.
+    """
+    def __init__(self, cfg, log_q, stats_q, lcd_q, stop_event, status_q=None, flags=None):
         super().__init__(daemon=True)
         self.cfg        = cfg
         self.log_q      = log_q
         self.stats_q    = stats_q
         self.lcd_q      = lcd_q        # ← queue for discovered LCD addresses
         self.stop_event = stop_event
+        self.status_q   = status_q or queue.Queue()
+        self.flags      = flags if flags is not None else {}
 
     def log(self, msg): self.log_q.put(msg)
+
+    def status(self, state, detail=""):
+        self.status_q.put((state, detail))
 
     def _on_lcd_found(self, addr_str):
         """Called when Arduino reports a discovered LCD during boot."""
         self.lcd_q.put(addr_str)
 
-    def run(self):
+    def _rx(self, line):
+        self.log(f"RX: {line}")
+        m = re.search(r"FOUND_LCD=0x([0-9A-Fa-f]+)", line, re.IGNORECASE)
+        if m: self._on_lcd_found("0x" + m.group(1).upper())
+
+    def _setup(self):
         cfg = self.cfg
-        self.log("─" * 55)
-        self.log("[INFO] PC Monitor starting up...")
-        self.log(f"[INFO] Port: {cfg['port']}  Baud: {cfg['baud']}")
-
-        if not PSUTIL_OK:
-            self.log("[ERROR] psutil not installed.  pip install psutil"); return
-        if not SERIAL_OK:
-            self.log("[ERROR] pyserial not installed.  pip install pyserial"); return
-
-        # LHM / temperature init
         global _lhm_computer, _lhm_available, _lhm_init_tried
         _lhm_computer = None; _lhm_available = False; _lhm_init_tried = False
-        dll = cfg["lhm_path"]
-
-        # Auto-download DLL and install pythonnet if needed
-        dll = _ensure_lhm_deps(dll, self.log)
-
+        dll = _ensure_lhm_deps(cfg["lhm_path"], self.log)
         if os.path.isfile(dll):
             self.log(f"[INFO] LHM DLL found: {dll}")
         else:
@@ -997,207 +1060,508 @@ class MonitorThread(threading.Thread):
             self.log("[WARN] Temperatures disabled (LHM unavailable)")
 
         # page_order is a list like [0,2,1,3] (indices: CPU=0 GPU=1 RAM=2 NET=3)
-        page_order = cfg.get("page_order", [0, 1, 2, 3])
-        page_names = ["CPU", "GPU", "RAM", "NET"]
-        mask = sum(1 << i for i in page_order)
-        if mask == 0: self.log("[WARN] No pages -- enabling CPU fallback."); mask = 1; page_order = [0]
-
-        self.log(f"[INFO] Page order: {' -> '.join(page_names[i] for i in page_order)}  |  Delay: {cfg['page_delay']} ms")
+        self.page_order = cfg.get("page_order", [0, 1, 2, 3]) or [0]
+        if not cfg.get("page_order"):
+            self.log("[WARN] No pages -- enabling CPU fallback.")
+        self.mask = sum(1 << i for i in self.page_order)
+        names = ["CPU", "GPU", "RAM", "NET"]
+        self.log(f"[INFO] Page order: {' -> '.join(names[i] for i in self.page_order)}"
+                 f"  |  Delay: {cfg['page_delay']} ms")
 
         raw_mb    = int(psutil.virtual_memory().total / (1024 * 1024))
         common_gb = [4,8,12,16,24,32,48,64,96,128,256]
         ram_gb    = min((g for g in common_gb if g >= raw_mb/1024.0), default=common_gb[-1])
-        ram_total = ram_gb * 1024
+        self.ram_total = ram_gb * 1024
         self.log(f"[INFO] RAM: {raw_mb} MB  ->  {ram_gb} GB")
-
-        vram_total = get_gpu_vram_total_mb(self.log)
-
-        link_speed = get_link_speed_mbps()
-        self.log(f"[INFO] NIC link: {link_speed} Mbps")
-
+        self.vram_total = get_gpu_vram_total_mb(self.log)
+        self.link_speed = get_link_speed_mbps()
+        self.log(f"[INFO] NIC link: {self.link_speed} Mbps")
         psutil.cpu_percent(interval=None)
-        net = NetSpeed()
+        self.net = NetSpeed()
 
-        # Build LCD2004 field from GUI config:
-        # lcd_types is a dict { "0x27": "1602", "0x26": "2004", ... }
-        def build_lcd2004_field():
-            lt = cfg.get("lcd_types", {})
-            addrs = [str(int(a, 16)) for a, t in lt.items() if t == "2004"]
-            return f"LCD2004={','.join(addrs)}" if addrs else ""
+    def _sample(self):
+        cpu = psutil.cpu_percent(interval=0.0)
+        mem = psutil.virtual_memory()
+        gpu, vram_mb = get_gpu_counters()
+        dl_kb, ul_kb = self.net.update()
+        s = {
+            "cpu": cpu, "cpu_temp": get_cpu_temp(),
+            "gpu": gpu, "gpu_temp": get_gpu_temp(),
+            "ram": mem.percent, "ram_mb": int(mem.used / (1024 * 1024)),
+            "ram_total_mb": self.ram_total,
+            "vram_mb": vram_mb, "vram_total_mb": self.vram_total,
+            "dl_kb": dl_kb, "ul_kb": ul_kb, "link_speed": self.link_speed,
+        }
+        self.stats_q.put(s)
+        return s
 
-        try:
-            import serial as ser_mod
-            with ser_mod.Serial(cfg["port"], cfg["baud"], timeout=0.2) as ser:
-                try: ser.dtr = False; ser.rts = False
-                except Exception: pass
-                time.sleep(0.2)
-                ser.reset_input_buffer(); ser.reset_output_buffer()
-                if not wait_for_ready(ser, 8.0, self.log, self._on_lcd_found):
-                    self.log("[INFO] No READY seen -- continuing anyway.")
-                self.log(f"[OK] Connected to {cfg['port']} @ {cfg['baud']} baud")
+    def _frame(self, s):
+        cfg = self.cfg
+        t10 = lambda v: int(round(v * 10)) if v >= 0 else -1
+        lt = cfg.get("lcd_types", {})
+        big = [str(int(a, 16)) for a, t in lt.items() if t == "2004"]
+        parts = [
+            f"CPU={t10(s['cpu'])};RAM={t10(s['ram'])};GPU={t10(s['gpu'])}",
+            f"DL={s['dl_kb']};UL={s['ul_kb']}",
+            f"RAMU={s['ram_mb']};RAMT={int(self.ram_total)};VRAM={s['vram_mb']};VRAMT={self.vram_total}",
+            f"TEMP={t10(s['cpu_temp'])};GPUT={t10(s['gpu_temp'])}",
+            f"LSPD={self.link_speed};PG={self.mask};PDLY={cfg['page_delay']};"
+            f"PGORD={','.join(str(i) for i in self.page_order)}",
+        ]
+        if big:
+            parts.append(f"LCD2004={','.join(big)}")
+        return ";".join(parts) + "\r\n"
 
-                while not self.stop_event.is_set():
-                    cpu     = psutil.cpu_percent(interval=0.0)
-                    mem     = psutil.virtual_memory()
-                    ram     = mem.percent
-                    ram_mb  = int(mem.used / (1024 * 1024))
-                    gpu     = get_gpu_usage_intel()
-                    vram_mb = get_gpu_vram_mb()
-                    cpu_t   = get_cpu_temp()
-                    gpu_t   = get_gpu_temp()
-                    dl_kb, ul_kb = net.update()
-
-                    stats_now = {
-                        "cpu": cpu, "cpu_temp": cpu_t,
-                        "gpu": gpu, "gpu_temp": gpu_t,
-                        "ram": ram, "ram_mb": ram_mb, "ram_total_mb": ram_total,
-                        "vram_mb": vram_mb, "vram_total_mb": vram_total,
-                        "dl_kb": dl_kb, "ul_kb": ul_kb,
-                        "link_speed": link_speed,
-                    }
-
-                    cpu10  = int(round(cpu * 10))
-                    ram10  = int(round(ram * 10))
-                    gpu10  = int(round(gpu * 10))
-                    temp10 = int(round(cpu_t * 10)) if cpu_t >= 0 else -1
-                    gput10 = int(round(gpu_t * 10)) if gpu_t >= 0 else -1
-                    pd     = cfg["page_delay"]
-
-                    # LCD type config field
-                    lcd2004_field = build_lcd2004_field()
-
-                    pgord_str = ",".join(str(i) for i in page_order)
-                    parts = [
-                        f"CPU={cpu10};RAM={ram10};GPU={gpu10}",
-                        f"DL={dl_kb};UL={ul_kb}",
-                        f"RAMU={ram_mb};RAMT={int(ram_total)};VRAM={vram_mb};VRAMT={vram_total}",
-                        f"TEMP={temp10};GPUT={gput10}",
-                        f"LSPD={link_speed};PG={mask};PDLY={pd};PGORD={pgord_str}",
-                    ]
-                    if lcd2004_field:
-                        parts.append(lcd2004_field)
-
-                    line = ";".join(parts) + "\r\n"
-                    ser.write(line.encode("ascii")); ser.flush()
-                    self.log(f"[DBG] RAW TX ({len(line)-2} chars): {line.strip()}")
-
-                    # Inject IDENT command if requested by GUI
-                    if getattr(self, '_app_ident_pending', False):
-                        ser.write(b"IDENT\r\n"); ser.flush()
-                        self._app_ident_pending = False
-
-                    ct_s = f"{cpu_t:.1f}°C" if cpu_t >= 0 else "N/A"
-                    gt_s = f"{gpu_t:.1f}°C" if gpu_t >= 0 else "N/A"
-                    vt_s = f"{vram_mb}/{vram_total}MB" if vram_total > 0 else (f"{vram_mb}MB" if vram_mb >= 0 else "N/A")
-                    self.log(
-                        f"TX | CPU {cpu:5.1f}% {ct_s:>7} | "
-                        f"GPU {gpu:5.1f}% {gt_s:>7} VRAM:{vt_s} | "
-                        f"RAM {ram:5.1f}% {ram_mb}MB | "
-                        f"DL:{dl_kb}K UL:{ul_kb}K")
-                    self.stats_q.put(stats_now)
-
-                    time.sleep(0.05)
-                    while ser.in_waiting:
+    def _session(self):
+        """One connection: open, wait for READY, stream until stopped or the port dies."""
+        import serial as ser_mod
+        cfg = self.cfg
+        self.status("connecting", cfg["port"])
+        with ser_mod.Serial(cfg["port"], cfg["baud"], timeout=0.2) as ser:
+            try: ser.dtr = False; ser.rts = False
+            except Exception: pass
+            time.sleep(0.2)
+            ser.reset_input_buffer(); ser.reset_output_buffer()
+            self.status("waiting", cfg["port"])
+            if not wait_for_ready(ser, 8.0, self.log, self._on_lcd_found, self.stop_event):
+                if self.stop_event.is_set():
+                    return
+                self.log("[INFO] No READY seen -- continuing anyway.")
+            self.log(f"[OK] Connected to {cfg['port']} @ {cfg['baud']} baud")
+            self.status("running", cfg["port"])
+            frames = 0
+            while not self.stop_event.is_set():
+                started = time.time()
+                s = self._sample()
+                line = self._frame(s)
+                ser.write(line.encode("ascii")); ser.flush()
+                frames += 1
+                if self.flags.get("verbose"):
+                    self.log(f"[DBG] TX {line.strip()}")
+                elif frames == 1:
+                    self.log("[OK] Streaming stats (enable 'Show raw serial traffic' in the Log tab to see frames)")
+                if self.flags.pop("ident", False):
+                    ser.write(b"IDENT\r\n"); ser.flush()
+                    self.log("[INFO] IDENT sent -- each screen shows its number")
+                # Read board replies until the next frame is due (~1 frame/second).
+                while not self.stop_event.is_set() and time.time() - started < 1.0:
+                    if ser.in_waiting:
                         rx = ser.readline().decode(errors="ignore").strip()
-                        if rx:
-                            self.log(f"RX: {rx}")
-                            m = re.search(r"FOUND_LCD=0x([0-9A-Fa-f]+)", rx, re.IGNORECASE)
-                            if m: self._on_lcd_found("0x" + m.group(1).upper())
+                        if rx and (self.flags.get("verbose") or rx not in ("OK",) and not rx.startswith("[DBG]")):
+                            self._rx(rx)
+                    else:
+                        time.sleep(0.05)
 
-                    # Read any Arduino responses
-                    deadline = time.time() + 0.9
-                    while time.time() < deadline:
-                        if ser.in_waiting:
-                            rx = ser.readline().decode(errors="ignore").strip()
-                            if rx:
-                                self.log(f"RX: {rx}")
-                                m = re.search(r"FOUND_LCD=0x([0-9A-Fa-f]+)", rx, re.IGNORECASE)
-                                if m: self._on_lcd_found("0x" + m.group(1).upper())
-                        else:
-                            time.sleep(0.05)
-
+    def run(self):
+        cfg = self.cfg
+        self.log("─" * 55)
+        self.log("[INFO] PC Monitor starting up...")
+        self.log(f"[INFO] Port: {cfg['port']}  Baud: {cfg['baud']}")
+        if not PSUTIL_OK:
+            self.log("[ERROR] psutil not installed.  pip install psutil")
+            self.status("error", "psutil missing"); return
+        if not SERIAL_OK:
+            self.log("[ERROR] pyserial not installed.  pip install pyserial")
+            self.status("error", "pyserial missing"); return
+        self.status("connecting", cfg["port"])
+        try:
+            self._setup()
         except Exception as e:
-            self.log(f"[ERROR] {e}")
             import traceback
+            self.log(f"[ERROR] Sensor setup failed: {e}")
             self.log(traceback.format_exc())
+            self.status("error", str(e)); return
 
+        import serial as ser_mod
+        while not self.stop_event.is_set():
+            try:
+                self._session()
+            except (ser_mod.SerialException, OSError) as e:
+                self.log(f"[ERROR] Serial: {e}")
+                if not cfg.get("auto_reconnect", True):
+                    self.status("error", str(e)); break
+                self.status("reconnecting", cfg["port"])
+                self.log(f"[INFO] Retrying {cfg['port']} every {RECONNECT_DELAY_S} s "
+                         "(plug the board back in, or press Stop)")
+                # keep the dashboard alive while the board is away
+                while not self.stop_event.wait(RECONNECT_DELAY_S):
+                    try:
+                        self._sample()
+                        import serial.tools.list_ports as lp
+                        if any(p.device == cfg["port"] for p in lp.comports()):
+                            break
+                    except Exception:
+                        break
+            except Exception as e:
+                import traceback
+                self.log(f"[ERROR] {e}")
+                self.log(traceback.format_exc())
+                self.status("error", str(e)); break
+        else:
+            self.status("stopped")
         self.log("[INFO] Monitor stopped.")
+        if self.stop_event.is_set():
+            self.status("stopped")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LCD PREVIEW MODEL -- mirrors the Arduino firmware's page layout
+# ══════════════════════════════════════════════════════════════════════════════
+# Bar cells are encoded as "\x01" (filled) / "\x02" (empty) inside row strings;
+# LCDPreview draws them as blocks. "°" is the degree glyph.
+_BAR_ON, _BAR_OFF = "\x01", "\x02"
+PAGE_NAMES = ["CPU", "GPU", "RAM", "NET"]
+
+def _bar(width, permille):
+    filled = max(0, min(width, permille * width // 1000))
+    return _BAR_ON * filled + _BAR_OFF * (width - filled)
+
+def _pct4(v10):  return f"{max(0, v10) // 10:3d}%"
+def _temp_dec(t10):  return " --.-" if t10 < 0 else f"{t10 // 10:2d}.{t10 % 10}°C"
+def _temp_int(t10):  return " -- " if t10 < 0 else f"{t10 // 10:2d}°C"
+
+def _mem_ratio(used, total):
+    if total >= 1024:
+        return f"{used // 1024}.{(used % 1024) * 10 // 1024}/{total // 1024}G"
+    return f"{used}/{total}M"
+
+def _vram_ratio(used, total):
+    ug, tg = used // 1024, total // 1024
+    if tg >= 10: return f"{ug}/{tg}G"
+    if tg > 0:   return f"{ug}.{(used % 1024) * 10 // 1024}/{tg}G"
+    return f"{used}/{total}M"
+
+def _speed5(kb):
+    kb = max(0, kb)
+    if kb >= 10000: return f"{kb // 1024:4d}M"
+    if kb >= 1000:
+        m = kb * 10 // 1024
+        return f"{m // 10}.{m % 10}M"
+    return f"{kb:4d}K"
+
+def _frame_values(s):
+    """The integer values the firmware receives for stats dict `s`."""
+    t10 = lambda v: int(round(v * 10)) if v is not None and v >= 0 else -1
+    return {
+        "cpu": t10(s.get("cpu", 0)), "ram": t10(s.get("ram", 0)), "gpu": t10(s.get("gpu", 0)),
+        "temp": t10(s.get("cpu_temp", -1)), "gput": t10(s.get("gpu_temp", -1)),
+        "ramu": int(s.get("ram_mb", 0)), "ramt": int(s.get("ram_total_mb", 0)),
+        "vram": int(s.get("vram_mb", -1)), "vramt": int(s.get("vram_total_mb", -1)),
+        "dl": int(s.get("dl_kb", 0)), "ul": int(s.get("ul_kb", 0)),
+        "lspd": int(s.get("link_speed", 1000)) or 1000,
+    }
+
+def _net_permille(kb, lspd):
+    return max(0, min(1000, kb * 1000 // (lspd * 125)))
+
+def render_1602(page, s):
+    """Two 16-char rows, same as show1602Page() in Arduino-PC-Monitor-1602."""
+    v = _frame_values(s)
+    if page == 0:
+        top = f"CPU {_pct4(v['cpu'])}  {_temp_dec(v['temp'])}"; bar = _bar(16, v["cpu"])
+    elif page == 1:
+        if v["gput"] % 10:          # firmware: (gput10 % 10 != 0), true for -1 (no sensor) too
+            top = f"GPU {_pct4(v['gpu'])}  {_temp_dec(v['gput'])}"
+        elif v["vramt"] >= 10240:
+            top = f"GPU {_pct4(v['gpu'])}   {_temp_int(v['gput'])} "
+        else:
+            vr = _vram_ratio(max(v["vram"], 0), v["vramt"]) if v["vramt"] > 0 else " -- "
+            top = f"GPU {vr:<6s}  {_temp_int(v['gput'])}"
+        bar = _bar(16, v["gpu"])
+    elif page == 2:
+        top = f"RAM{_pct4(v['ram'])} {_mem_ratio(v['ramu'], v['ramt'])}"; bar = _bar(16, v["ram"])
+    else:
+        top = f"DL:{_speed5(v['dl'])} UL:{_speed5(v['ul'])}"
+        bar = _bar(8, _net_permille(v["dl"], v["lspd"])) + _bar(8, _net_permille(v["ul"], v["lspd"]))
+    return [top[:16].ljust(16), bar]
+
+def _compose(left, mid, right, cols=20):
+    row = [" "] * cols
+    row[:len(left)] = left[:cols]
+    if len(right) <= cols:
+        row[cols - len(right):] = right
+    if mid:
+        gs, ge = len(left) + 1, (cols - len(right) - 1 if len(right) + 1 <= cols else 0)
+        if gs < ge and len(mid) <= ge - gs:
+            st = gs + (ge - gs - len(mid)) // 2
+            row[st:st + len(mid)] = mid
+    return "".join(row[:cols])
+
+def render_2004_block(page, s):
+    """One metric block (label row + bar row), same as renderBlock() in the 2004 firmware."""
+    v = _frame_values(s)
+    if page == 0:
+        return [_compose(f"CPU {_pct4(v['cpu'])}", "", _temp_dec(v["temp"])), _bar(20, v["cpu"])]
+    if page == 1:
+        t = _temp_dec(v["gput"]) if v["gput"] >= 0 and v["gput"] % 10 else _temp_int(v["gput"])
+        vr = _vram_ratio(max(v["vram"], 0), v["vramt"]) if v["vramt"] > 0 else ""
+        return [_compose(f"GPU {_pct4(v['gpu'])}", vr, t), _bar(20, v["gpu"])]
+    if page == 2:
+        return [_compose(f"RAM {_pct4(v['ram'])}", "", _mem_ratio(v["ramu"], v["ramt"])), _bar(20, v["ram"])]
+    return [_compose(f"DL{_speed5(v['dl'])}", "", f"UL{_speed5(v['ul'])}"),
+            _bar(10, _net_permille(v["dl"], v["lspd"])) + _bar(10, _net_permille(v["ul"], v["lspd"]))]
+
+def distribute_pages(n_lcds, pages):
+    """Which pages each screen cycles through -- distributePages() in the firmware:
+    one page per screen, and the last screen rotates through whatever is left."""
+    if n_lcds <= 0 or not pages:
+        return []
+    if len(pages) <= n_lcds:
+        return [[p] for p in pages] + [[] for _ in range(n_lcds - len(pages))]
+    fixed = n_lcds - 1
+    return [[p] for p in pages[:fixed]] + [pages[fixed:]]
+
+def screen_rows(kind, pages, step, s):
+    """Rows a screen of `kind` ("1602"/"2004") shows at rotation `step`."""
+    if not pages:
+        return [""] * (2 if kind == "1602" else 4)
+    if kind == "1602":
+        return render_1602(pages[step % len(pages)], s)
+    views = (len(pages) + 1) // 2
+    top = (step % views) * 2
+    rows = render_2004_block(pages[top], s)
+    rows += render_2004_block(pages[top + 1], s) if top + 1 < len(pages) else [" " * 20] * 2
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  REUSABLE WIDGETS
 # ══════════════════════════════════════════════════════════════════════════════
+UI_FONT, MONO_FONT = "Segoe UI", "Consolas"
+MAX_LOG_LINES = 2000
+HISTORY_LEN = 90   # samples kept for sparklines (~1.5 min at 1 frame/s)
 
-class StatBar(tk.Frame):
-    def __init__(self, parent, label, **kw):
-        super().__init__(parent, bg=BG2, **kw)
-        tk.Label(self, text=label, bg=BG2, fg=TEXT_DIM,
-                 font=("Consolas", 9), width=5, anchor="e").pack(side="left", padx=(6,4))
-        self._canvas = tk.Canvas(self, bg=BG3, height=14, highlightthickness=0)
-        self._canvas.pack(side="left", fill="x", expand=True, pady=3)
-        self._bar = self._canvas.create_rectangle(0, 0, 0, 14, fill=GREEN, outline="")
-        self._val = tk.Label(self, text="  0.0%", bg=BG2, fg=TEXT,
-                              font=("Consolas", 9), width=12, anchor="w")
-        self._val.pack(side="left", padx=(4, 6))
+def _level_color(pct, warn=60, hot=85):
+    return GREEN if pct < warn else (YELLOW if pct < hot else RED)
 
-    def set(self, pct, label=""):
-        w = self._canvas.winfo_width()
-        fill = max(0, min(w, int(w * pct / 100)))
-        self._canvas.coords(self._bar, 0, 0, fill, 14)
-        c = GREEN if pct < 60 else (YELLOW if pct < 85 else RED)
-        self._canvas.itemconfig(self._bar, fill=c)
-        self._val.config(text=label or f"{pct:5.1f}%")
+def _temp_color(t):
+    return TEXT_DIM if t is None or t < 0 else (GREEN if t < 65 else (YELLOW if t < 80 else RED))
+
+def _fmt_rate(kb):
+    if kb >= 1024 * 1024: return f"{kb / 1024 / 1024:.2f} GB/s"
+    if kb >= 1024:        return f"{kb / 1024:.1f} MB/s"
+    return f"{kb:.0f} KB/s"
 
 
-class TempLabel(tk.Label):
-    def set(self, val):
-        if val < 0: self.config(text="", fg=TEXT_DIM)
+class FlatButton(tk.Label):
+    """A flat, hover-aware button (tk.Button ignores bg colours on some themes)."""
+    def __init__(self, parent, text, command, bg=BG3, fg=TEXT, hover=None,
+                 font=(UI_FONT, 9), padx=12, pady=5, **kw):
+        super().__init__(parent, text=text, bg=bg, fg=fg, font=font, padx=padx,
+                         pady=pady, cursor="hand2", **kw)
+        self._bg, self._hover, self._cmd, self._enabled = bg, hover or BORDER, command, True
+        self.bind("<Enter>", lambda e: self._enabled and super(FlatButton, self).config(bg=self._hover))
+        self.bind("<Leave>", lambda e: super(FlatButton, self).config(bg=self._bg))
+        self.bind("<ButtonRelease-1>", self._click)
+
+    def _click(self, e):
+        if self._enabled and self._cmd and 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height():
+            self._cmd()
+
+    def style(self, text=None, bg=None, fg=None, hover=None, enabled=None):
+        if bg is not None: self._bg = bg
+        if hover is not None: self._hover = hover
+        if enabled is not None:
+            self._enabled = enabled
+            self.config(cursor="hand2" if enabled else "arrow")
+        kw = {"bg": self._bg}
+        if text is not None: kw["text"] = text
+        if fg is not None: kw["fg"] = fg
+        super().config(**kw)
+
+
+class Card(tk.Frame):
+    """Rounded-feeling panel: title row + body frame."""
+    def __init__(self, parent, title="", subtitle="", **kw):
+        super().__init__(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1, **kw)
+        self.header = tk.Frame(self, bg=BG2)
+        self.header.pack(fill="x", padx=14, pady=(10, 4))
+        if title:
+            tk.Label(self.header, text=title, bg=BG2, fg=TEXT,
+                     font=(UI_FONT, 10, "bold")).pack(side="left")
+        if subtitle:
+            tk.Label(self.header, text=subtitle, bg=BG2, fg=TEXT_DIM,
+                     font=(UI_FONT, 8)).pack(side="left", padx=(8, 0), pady=(2, 0))
+        self.body = tk.Frame(self, bg=BG2)
+        self.body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+
+
+class Sparkline(tk.Canvas):
+    """Filled line chart of recent samples. Series values are 0..100 unless
+    autoscale is set (then scaled to the largest visible value)."""
+    def __init__(self, parent, colors=(ACCENT,), height=46, autoscale=False, **kw):
+        super().__init__(parent, bg=BG2, height=height, highlightthickness=0, **kw)
+        self.colors, self.autoscale = colors, autoscale
+        self.series = [[] for _ in colors]
+        self.bind("<Configure>", lambda e: self.redraw())
+
+    def push(self, *values):
+        for i, v in enumerate(values):
+            self.series[i].append(max(0.0, float(v)))
+            del self.series[i][:-HISTORY_LEN]
+        self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 10 or h < 10:
+            return
+        for frac in (0.5,):
+            self.create_line(0, h * frac, w, h * frac, fill=BG3, dash=(2, 4))
+        top = 100.0
+        if self.autoscale:
+            top = max([1.0] + [v for s in self.series for v in s]) * 1.15
+        step = w / (HISTORY_LEN - 1)
+        for color, data in zip(self.colors, self.series):
+            if len(data) < 2:
+                continue
+            x0 = w - step * (len(data) - 1)
+            pts = []
+            for i, v in enumerate(data):
+                pts += [x0 + i * step, h - 2 - (h - 4) * min(v, top) / top]
+            if len(self.colors) == 1:
+                self.create_polygon(pts[0], h, *pts, pts[-2], h, fill=_blend(color, BG2, 0.22), outline="")
+            self.create_line(*pts, fill=color, width=2, smooth=True)
+
+
+def _blend(c1, c2, a):
+    """Mix colour c1 into c2 by alpha a (Tk has no alpha)."""
+    r1, g1, b1 = (int(c1[i:i + 2], 16) for i in (1, 3, 5))
+    r2, g2, b2 = (int(c2[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % (int(r2 + (r1 - r2) * a), int(g2 + (g1 - g2) * a), int(b2 + (b1 - b2) * a))
+
+
+class UsageBar(tk.Canvas):
+    def __init__(self, parent, height=8, **kw):
+        super().__init__(parent, bg=BG3, height=height, highlightthickness=0, **kw)
+        self._pct, self._color = 0.0, GREEN
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, pct, color=None):
+        self._pct, self._color = max(0.0, min(100.0, pct)), color or _level_color(pct)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if self._pct > 0:
+            self.create_rectangle(0, 0, max(2, w * self._pct / 100), h, fill=self._color, outline="")
+
+
+class MetricCard(tk.Frame):
+    """Big-number tile: name, value, temperature chip, detail line, bar, sparkline."""
+    def __init__(self, parent, name, color, **kw):
+        super().__init__(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1, **kw)
+        self.color = color
+        top = tk.Frame(self, bg=BG2); top.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(top, text="●", bg=BG2, fg=color, font=(UI_FONT, 9)).pack(side="left")
+        tk.Label(top, text=f" {name}", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9, "bold")).pack(side="left")
+        self.temp = tk.Label(top, text="", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 10, "bold"))
+        self.temp.pack(side="right")
+        self.value = tk.Label(self, text="--", bg=BG2, fg=TEXT, font=(UI_FONT, 26, "bold"), anchor="w")
+        self.value.pack(fill="x", padx=12)
+        self.detail = tk.Label(self, text=" ", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9), anchor="w")
+        self.detail.pack(fill="x", padx=14)
+        self.bar = UsageBar(self); self.bar.pack(fill="x", padx=14, pady=(6, 4))
+        self.spark = Sparkline(self, colors=(color,)); self.spark.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def update_values(self, pct, value_text, detail="", temp=None):
+        self.value.config(text=value_text)
+        self.detail.config(text=detail or " ")
+        self.bar.set(pct)
+        self.spark.push(pct)
+        if temp is None or temp < 0:
+            self.temp.config(text="", fg=TEXT_DIM)
         else:
-            c = GREEN if val < 65 else (YELLOW if val < 80 else RED)
-            self.config(text=f" {val:.1f}°C", fg=c)
+            self.temp.config(text=f"{temp:.0f}°C", fg=_temp_color(temp))
 
 
-CELL_W, CELL_H = 14, 20
-
-class LCDWidget(tk.Canvas):
-    PAD_X, PAD_Y = 14, 10
+class NetCard(tk.Frame):
     def __init__(self, parent, **kw):
-        w = 16 * CELL_W + self.PAD_X * 2
-        h = 2  * CELL_H + self.PAD_Y * 2 + 8
-        super().__init__(parent, width=w, height=h, bg=LCD_FRAME, highlightthickness=0, **kw)
-        self.create_rectangle(0, 0, w, h, fill=LCD_FRAME, outline="")
-        sx, sy = self.PAD_X-6, self.PAD_Y-4
-        self.create_rectangle(sx, sy, w-sx, h-sy, fill=LCD_BG, outline="#1a2e1a", width=2)
+        super().__init__(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1, **kw)
+        top = tk.Frame(self, bg=BG2); top.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(top, text="●", bg=BG2, fg=YELLOW, font=(UI_FONT, 9)).pack(side="left")
+        tk.Label(top, text=" NETWORK", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9, "bold")).pack(side="left")
+        self.link = tk.Label(top, text="", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9))
+        self.link.pack(side="right")
+        vals = tk.Frame(self, bg=BG2); vals.pack(fill="x", padx=12)
+        self.dl = tk.Label(vals, text="↓ --", bg=BG2, fg=TEXT, font=(UI_FONT, 18, "bold"))
+        self.dl.pack(side="left")
+        self.ul = tk.Label(vals, text="↑ --", bg=BG2, fg=ACCENT2, font=(UI_FONT, 18, "bold"))
+        self.ul.pack(side="left", padx=(18, 0))
+        self.detail = tk.Label(self, text="Download  ·  Upload", bg=BG2, fg=TEXT_DIM,
+                               font=(UI_FONT, 9), anchor="w")
+        self.detail.pack(fill="x", padx=14, pady=(2, 6))
+        self.spark = Sparkline(self, colors=(YELLOW, ACCENT2), autoscale=True)
+        self.spark.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def update_values(self, dl_kb, ul_kb, link):
+        self.dl.config(text=f"↓ {_fmt_rate(dl_kb)}", fg=YELLOW)
+        self.ul.config(text=f"↑ {_fmt_rate(ul_kb)}")
+        self.link.config(text=f"{link} Mbps link" if link else "")
+        self.spark.push(dl_kb, ul_kb)
+
+
+class LCDPreview(tk.Canvas):
+    """A character LCD drawn cell by cell (16x2 or 20x4), green-on-black."""
+    CW, CH, GAP = 11, 17, 2
+
+    def __init__(self, parent, cols=16, rows=2, **kw):
+        self.cols, self.rows = cols, rows
+        w = cols * (self.CW + self.GAP) + 22
+        h = rows * (self.CH + self.GAP) + 18
+        super().__init__(parent, width=w, height=h, bg=BG2, highlightthickness=0, **kw)
+        self.create_rectangle(1, 1, w - 1, h - 1, fill=LCD_FRAME, outline=BORDER)
+        self.create_rectangle(7, 6, w - 7, h - 6, fill=LCD_BG, outline="#1a2e1a")
         self._cells = []
-        for row in range(2):
-            row_items = []
-            for col in range(16):
-                x = self.PAD_X + col * CELL_W + CELL_W // 2
-                y = self.PAD_Y + row * (CELL_H + 8) + CELL_H // 2
-                row_items.append(self.create_text(x, y, text=" ", fill=LCD_DIM,
-                                                   font=("Courier", 11, "bold"), anchor="center"))
-            self._cells.append(row_items)
+        for r in range(rows):
+            for c in range(cols):
+                x = 11 + c * (self.CW + self.GAP)
+                y = 9 + r * (self.CH + self.GAP)
+                bg = self.create_rectangle(x, y, x + self.CW, y + self.CH, fill=LCD_DIM, outline="")
+                tx = self.create_text(x + self.CW / 2, y + self.CH / 2, text="", fill=LCD_ON,
+                                      font=(MONO_FONT, 10, "bold"))
+                self._cells.append((bg, tx))
+        self._last = None
 
-    def set_lines(self, line1, line2):
-        for row, line in enumerate([line1[:16].ljust(16), line2[:16].ljust(16)]):
-            for col, ch in enumerate(line):
-                self.itemconfig(self._cells[row][col], text=ch,
-                                fill=LCD_ON if ch != " " else LCD_DIM)
-
+    def set_rows(self, rows):
+        rows = [(r + " " * self.cols)[:self.cols] for r in (rows + [""] * self.rows)[:self.rows]]
+        if rows == self._last:
+            return
+        self._last = rows
+        for r, line in enumerate(rows):
+            for c, ch in enumerate(line):
+                bg, tx = self._cells[r * self.cols + c]
+                if ch == _BAR_ON:
+                    self.itemconfig(bg, fill=LCD_ON); self.itemconfig(tx, text="")
+                elif ch == _BAR_OFF:
+                    self.itemconfig(bg, fill="#173d1f"); self.itemconfig(tx, text="")
+                else:
+                    self.itemconfig(bg, fill=LCD_DIM); self.itemconfig(tx, text=ch)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+_STATUS_LOOK = {
+    "stopped":      ("Stopped",          TEXT_DIM),
+    "connecting":   ("Connecting…",      YELLOW),
+    "waiting":      ("Waiting for board…", YELLOW),
+    "running":      ("Streaming",        GREEN),
+    "reconnecting": ("Board disconnected, retrying…", YELLOW),
+    "error":        ("Error",            RED),
+    "stopping":     ("Stopping…",        TEXT_DIM),
+}
+_COMMON_BAUDS = ["9600", "19200", "38400", "57600", "115200", "230400", "250000", "500000", "1000000"]
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PC Monitor Sender -- Rozakos Industries")
         self.configure(bg=BG)
-        self.geometry("1380x960")
-        self.minsize(1100, 780)
-        # Set window icon
+        self.geometry("1180x800")
+        self.minsize(980, 680)
         try:
             if os.path.isfile(BRAND_ICO):
                 self.iconbitmap(BRAND_ICO)
@@ -1206,7 +1570,6 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._quit_app)
         self._tray_icon = None
         self._tray_thread = None
-        self._ident_cmd_pending = False
         # Launched by the boot task? -> start hidden in the tray.
         self._start_minimized = _MINIMIZED_FLAG in _sys.argv
 
@@ -1215,102 +1578,93 @@ class App(tk.Tk):
         self._log_q        = queue.Queue()
         self._stats_q      = queue.Queue()
         self._lcd_q        = queue.Queue()   # discovered LCD addresses
+        self._status_q     = queue.Queue()
+        self._flags        = {"verbose": False}   # shared with MonitorThread
         self._running      = False
+        self._state        = "stopped"
         self._latest_stats = {}
+        self._preview_step = 0
         # Pinned boot port: when set, _refresh_ports always prefers this device
         # (raw "COMx") over the USB auto-detect. None = auto-detect.
         self._default_port = None
+        self._port_labels  = {}
 
         # LCD type config:  { "0x27": "1602", "0x26": "2004", ... }
         self._lcd_types: dict[str, str] = {}
-        # Per-address StringVars bound to the OptionMenus in the LCD config panel
         self._lcd_type_vars: dict[str, tk.StringVar] = {}
-        # The inner frame that holds the LCD config rows (populated dynamically)
-        self._lcd_cfg_inner: tk.Frame | None = None
-        self._lcd_hint_lbl:  tk.Label | None = None
+        self._lcd_hint_lbl = None
 
-
-        self._style_notebook()
-        self._style_combobox()
+        self._style_ttk()
         self.withdraw()            # hide main window until splash done
         self.after(0, self._show_splash)
 
-    # ── NOTEBOOK STYLE ────────────────────────────────────────────────────────
-    def _style_combobox(self):
+    # ── ttk styling ──────────────────────────────────────────────────────────
+    def _style_ttk(self):
         s = ttk.Style(self)
-        s.configure("TCombobox",
-                     fieldbackground=BG3,
-                     background=BG3,
-                     foreground=TEXT,
-                     selectbackground=ACCENT,
-                     selectforeground="#1a1b26",
-                     arrowcolor=TEXT_DIM,
-                     borderwidth=0)
-        s.map("TCombobox",
-              fieldbackground=[("readonly", BG3), ("!readonly", BG3)],
+        s.theme_use("clam")
+        flat = dict(bordercolor=BG, lightcolor=BG, darkcolor=BG, borderwidth=0)
+        s.configure("TNotebook", background=BG, tabmargins=[16, 4, 16, 0], **flat)
+        s.configure("TNotebook.Tab", background=BG, foreground=TEXT_DIM,
+                    font=(UI_FONT, 10, "bold"), padding=[16, 7], focuscolor=BG, **flat)
+        s.map("TNotebook.Tab", background=[("selected", BG3), ("active", BG2)],
+              foreground=[("selected", TEXT), ("active", TEXT)],
+              bordercolor=[("selected", BG3)], lightcolor=[("selected", BG3)])
+        s.configure("TCombobox", fieldbackground=BG3, background=BG3, foreground=TEXT,
+                    selectbackground=BG3, selectforeground=TEXT, arrowcolor=TEXT_DIM,
+                    bordercolor=BORDER, lightcolor=BG3, darkcolor=BG3, padding=4)
+        s.map("TCombobox", fieldbackground=[("readonly", BG3), ("!readonly", BG3)],
               foreground=[("readonly", TEXT), ("!readonly", TEXT)],
-              background=[("active", BG2), ("!active", BG3)])
+              background=[("active", BORDER), ("!active", BG3)])
         self.option_add("*TCombobox*Listbox.background", BG2)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
-        self.option_add("*TCombobox*Listbox.selectForeground", "#1a1b26")
-        self.option_add("*TCombobox*Listbox.font", ("Consolas", 10))
-
-    def _style_notebook(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure("TNotebook",     background=BG, borderwidth=0)
-        s.configure("TNotebook.Tab", background=BG3, foreground=TEXT_DIM,
-                     font=("Segoe UI", 9, "bold"), padding=[14, 6])
-        s.map("TNotebook.Tab",
-              background=[("selected", BG2)],
-              foreground=[("selected", ACCENT)])
+        self.option_add("*TCombobox*Listbox.selectForeground", BG)
+        self.option_add("*TCombobox*Listbox.font", (MONO_FONT, 10))
+        s.configure("Horizontal.TProgressbar", troughcolor=BG3, background=ACCENT,
+                    bordercolor=BG3, lightcolor=ACCENT, darkcolor=ACCENT)
+        s.configure("Horizontal.TScale", background=ACCENT, troughcolor=BG3, bordercolor=BG2,
+                    lightcolor=ACCENT, darkcolor=ACCENT, sliderthickness=16, gripcount=0)
+        s.map("Horizontal.TScale", background=[("active", _blend(ACCENT, "#ffffff", 0.8))])
+        s.configure("Vertical.TScrollbar", background=BG3, troughcolor=BG2, bordercolor=BG2,
+                    arrowcolor=TEXT_DIM, lightcolor=BG3, darkcolor=BG3, gripcount=0)
+        # clam paints a disabled (nothing to scroll) thumb in its light default colour
+        s.map("Vertical.TScrollbar", background=[("disabled", BG2), ("pressed", ACCENT), ("active", BORDER)],
+              troughcolor=[("disabled", BG2)])
 
     # ── SPLASH SCREEN ────────────────────────────────────────────────────────
+    def _logo_image(self):
+        try:
+            import base64 as _b64, io as _io
+            from PIL import Image as _Img, ImageTk as _ITk
+            pimg = _Img.open(_io.BytesIO(_b64.b64decode(_FULL_LOGO_B64))).convert("RGBA")
+            return _ITk.PhotoImage(pimg)
+        except Exception:
+            return None
+
     def _show_splash(self):
-        """Branded splash for ~2 seconds with animated loading bar."""
+        """Branded splash with an animated loading bar."""
         splash = tk.Toplevel(self)
         splash.overrideredirect(True)
         splash.configure(bg=BG)
         splash.attributes("-topmost", True)
-        try:
-            if os.path.isfile(BRAND_ICO):
-                splash.iconbitmap(BRAND_ICO)
-        except Exception:
-            pass
-
-        # Logo
-        try:
-            import base64 as _b64, io as _io
-            from PIL import Image as _Img, ImageTk as _ITk
-            raw   = _b64.b64decode(_FULL_LOGO_B64)
-            pimg  = _Img.open(_io.BytesIO(raw)).convert("RGBA")
-            tkimg = _ITk.PhotoImage(pimg)
-            lbl   = tk.Label(splash, image=tkimg, bg=BG)
-            lbl.image = tkimg
+        img = self._logo_image()
+        if img:
+            lbl = tk.Label(splash, image=img, bg=BG); lbl.image = img
             lbl.pack(padx=50, pady=(40, 6))
-        except Exception:
-            tk.Label(splash, text="ROZAKOS INDUSTRIES",
-                     bg=BG, fg="#9e1a1a",
-                     font=("Segoe UI", 22, "bold")).pack(padx=60, pady=(40, 8))
-
+        else:
+            tk.Label(splash, text="ROZAKOS INDUSTRIES", bg=BG, fg="#9e1a1a",
+                     font=(UI_FONT, 22, "bold")).pack(padx=60, pady=(40, 8))
         tk.Label(splash, text=f"PC Monitor Sender  v{APP_VERSION}",
-                 bg=BG, fg=ACCENT, font=("Segoe UI", 10)).pack(pady=(4, 2))
-        tk.Label(splash, text=BRAND_URL,
-                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(pady=(0, 28))
-
-        # Animated loading bar at very bottom
-        bar_bg   = tk.Frame(splash, bg=BG3, height=4)
-        bar_bg.pack(fill="x", side="bottom")
+                 bg=BG, fg=ACCENT, font=(UI_FONT, 10)).pack(pady=(4, 2))
+        tk.Label(splash, text=BRAND_URL, bg=BG, fg=TEXT_DIM, font=(UI_FONT, 8)).pack(pady=(0, 28))
+        bar_bg = tk.Frame(splash, bg=BG3, height=4); bar_bg.pack(fill="x", side="bottom")
         bar_fill = tk.Frame(bar_bg, bg=ACCENT, height=4)
         bar_fill.place(x=0, y=0, relheight=1, width=0)
-
         splash.update_idletasks()
         sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
-        w,  h  = splash.winfo_width(), splash.winfo_height()
+        w, h = splash.winfo_width(), splash.winfo_height()
         splash.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
-
-        DURATION, STEPS = 1800, 60
+        DURATION, STEPS = 1100, 40
 
         def _step(i=0):
             if not splash.winfo_exists():
@@ -1319,469 +1673,569 @@ class App(tk.Tk):
             if i < STEPS:
                 splash.after(DURATION // STEPS, _step, i + 1)
             else:
-                splash.after(150, _finish)
+                splash.after(100, _finish)
 
         def _finish():
-            try:
-                splash.destroy()
-            except Exception:
-                pass
+            try: splash.destroy()
+            except Exception: pass
             self._build_ui()
-            self._apply_settings(load_settings())   # restore last-used config
+            settings = load_settings()
+            self._apply_settings(settings)   # restore last-used config
             self._poll()
+            self._tick_preview()
             if self._start_minimized and TRAY_OK:
-                # Boot launch: stay hidden, drop straight into the tray.
-                self._start_tray()
+                self._start_tray()           # boot launch: straight to the tray
             else:
                 self.deiconify()
-            if self._start_minimized:
-                # Boot launch: begin monitoring once the port scan has run.
+            if self._start_minimized or settings.get("autostart_on_open"):
                 self.after(1200, self._autostart_monitor)
-            else:
-                # First-run convenience: offer to fetch LHM if it's missing.
+            if not self._start_minimized:
                 self.after(700, self._maybe_prompt_lhm_download)
 
         splash.after(50, _step)
 
     # ── ABOUT DIALOG ─────────────────────────────────────────────────────────
     def _show_about(self):
-        """Modal About dialog with logo, version and links."""
         dlg = tk.Toplevel(self)
         dlg.title("About")
         dlg.configure(bg=BG)
         dlg.resizable(False, False)
-        dlg.grab_set()          # modal
-        dlg.attributes("-topmost", True)
+        dlg.transient(self)
+        dlg.grab_set()
         try:
             if os.path.isfile(BRAND_ICO):
                 dlg.iconbitmap(BRAND_ICO)
         except Exception:
             pass
-
-        # Logo
-        try:
-            import base64 as _b64, io as _io
-            from PIL import Image as _Img, ImageTk as _ITk
-            raw   = _b64.b64decode(_FULL_LOGO_B64)
-            pimg  = _Img.open(_io.BytesIO(raw)).convert("RGBA")
-            tkimg = _ITk.PhotoImage(pimg)
-            lbl   = tk.Label(dlg, image=tkimg, bg=BG)
-            lbl.image = tkimg
+        img = self._logo_image()
+        if img:
+            lbl = tk.Label(dlg, image=img, bg=BG); lbl.image = img
             lbl.pack(padx=40, pady=(30, 4))
-        except Exception:
-            tk.Label(dlg, text="ROZAKOS INDUSTRIES",
-                     bg=BG, fg="#9e1a1a",
-                     font=("Segoe UI", 18, "bold")).pack(pady=(30, 4))
-
-        tk.Label(dlg, text="PC Monitor Sender",
-                 bg=BG, fg=TEXT, font=("Segoe UI", 12, "bold")).pack()
-        tk.Label(dlg, text=f"Version {APP_VERSION}",
-                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(pady=(2, 12))
-
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=24, pady=4)
-
-        # Changelog
-        tk.Label(dlg, text="Changelog", bg=BG, fg=ACCENT,
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=28, pady=(8,2))
-        tk.Label(dlg, text="v1.0.0\n  • Initial release\n  • CPU, GPU, RAM, Network monitoring\n  • Multi-LCD support (1602 / 2004)\n  • System tray, page order editor\n  • LibreHardwareMonitor integration",
-                 bg=BG, fg=TEXT_DIM, font=("Consolas", 8),
-                 justify="left").pack(anchor="w", padx=32, pady=(0,12))
-
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=24, pady=4)
-
-        # Links
+        tk.Label(dlg, text="PC Monitor Sender", bg=BG, fg=TEXT, font=(UI_FONT, 12, "bold")).pack()
+        tk.Label(dlg, text=f"Version {APP_VERSION}", bg=BG, fg=TEXT_DIM, font=(UI_FONT, 9)).pack(pady=(2, 12))
+        tk.Label(dlg, text="What's new", bg=BG, fg=ACCENT, font=(UI_FONT, 9, "bold")).pack(anchor="w", padx=28, pady=(8, 2))
+        tk.Label(dlg, justify="left", bg=BG, fg=TEXT_DIM, font=(UI_FONT, 9), text=(
+            "v1.1.0\n"
+            "  • Redesigned window: dashboard cards with live history graphs\n"
+            "  • Live preview of exactly what each LCD is showing\n"
+            "  • Settings split into Display / Connection / Log tabs\n"
+            "  • Reconnects automatically when the board is unplugged\n"
+            "  • One click Start/Stop, also from the tray menu\n"
+            "  • Quieter log (raw serial traffic is optional), capped size\n"
+            "  • GPU load matches Task Manager, faster sampling\n"
+            "v1.0.0\n"
+            "  • Initial release")).pack(anchor="w", padx=32, pady=(0, 12))
         import webbrowser
-        links_frame = tk.Frame(dlg, bg=BG)
-        links_frame.pack(pady=12)
-
-        def link(parent, text, target):
-            l = tk.Label(parent, text=text, bg=BG, fg=ACCENT2,
-                         font=("Segoe UI", 9, "underline"), cursor="hand2")
+        links = tk.Frame(dlg, bg=BG); links.pack(pady=8)
+        for text, target in ((BRAND_URL, BRAND_URL), (BRAND_EMAIL, "mailto:" + BRAND_EMAIL)):
+            l = tk.Label(links, text=text, bg=BG, fg=ACCENT2, font=(UI_FONT, 9, "underline"), cursor="hand2")
             l.pack(side="left", padx=10)
-            l.bind("<Button-1>", lambda e: webbrowser.open(target))
-            l.bind("<Enter>", lambda e: l.config(fg=ACCENT))
-            l.bind("<Leave>", lambda e: l.config(fg=ACCENT2))
-
-        link(links_frame, "🌐  " + BRAND_URL, BRAND_URL)
-        link(links_frame, "✉  " + BRAND_EMAIL, "mailto:" + BRAND_EMAIL)
-
-        tk.Button(dlg, text="Close", bg=BG3, fg=TEXT_DIM,
-                  font=("Segoe UI", 9), relief="flat", padx=20, pady=6,
-                  cursor="hand2", command=dlg.destroy).pack(pady=(4, 24))
-
+            l.bind("<Button-1>", lambda e, t=target: webbrowser.open(t))
+        FlatButton(dlg, "Close", dlg.destroy).pack(pady=(8, 24))
         dlg.update_idletasks()
-        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
-        w, h   = dlg.winfo_width(), dlg.winfo_height()
-        dlg.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-    # ── TOP BAR + NOTEBOOK ────────────────────────────────────────────────────
+    # ── LAYOUT ────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        top = tk.Frame(self, bg=BG, pady=8); top.pack(fill="x", padx=12)
-        tk.Label(top, text="⬡  PC Monitor Sender", bg=BG, fg=ACCENT,
-                 font=("Segoe UI", 14, "bold")).pack(side="left")
-        # Start-on-boot toggle (prominent, in the header).
-        self._startup_var = tk.BooleanVar(value=_startup_enabled())
-        tk.Checkbutton(
-            top, text="  ⏻ Start on boot (to tray)",
-            variable=self._startup_var, command=self._toggle_startup,
-            bg=BG, fg=TEXT, selectcolor=BG3, activebackground=BG,
-            activeforeground=TEXT, font=("Segoe UI", 9), cursor="hand2",
-            highlightthickness=0, bd=0).pack(side="left", padx=(18, 0))
-        self._status_dot = tk.Label(top, text="●", bg=BG, fg=TEXT_DIM, font=("Segoe UI", 16))
-        self._status_dot.pack(side="right", padx=(0,4))
-        self._status_lbl = tk.Label(top, text="Stopped", bg=BG, fg=TEXT_DIM, font=("Segoe UI", 10))
-        self._status_lbl.pack(side="right")
+        self._build_header()
+        self._build_footer()
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=0, pady=(0, 0))
+        self._nb = nb
+        tabs = {}
+        for key, title in (("dash", "Dashboard"), ("display", "Display"),
+                           ("conn", "Connection"), ("log", "Log")):
+            fr = tk.Frame(nb, bg=BG2)
+            nb.add(fr, text=f"  {title}  ")
+            inner = tk.Frame(fr, bg=BG)
+            inner.pack(fill="both", expand=True)
+            tabs[key] = inner
+        self._tabs = tabs
+        # log first (others log into it), dashboard last (it previews the display settings)
+        self._build_log(tabs["log"])
+        self._build_display_tab(tabs["display"])
+        self._build_connection_tab(tabs["conn"])
+        self._build_dashboard(tabs["dash"])
+
+    def _build_footer(self):
+        footer = tk.Frame(self, bg=BG, pady=5)
+        footer.pack(fill="x", side="bottom")
+        tk.Label(footer, text="ROZAKOS INDUSTRIES", bg=BG, fg="#9e1a1a",
+                 font=(UI_FONT, 8, "bold")).pack(side="left", padx=(18, 0))
+        tk.Label(footer, text=f"v{APP_VERSION}", bg=BG, fg=TEXT_DIM,
+                 font=(UI_FONT, 8)).pack(side="left", padx=6)
+        import webbrowser
+        for text, target in ((BRAND_EMAIL, "mailto:" + BRAND_EMAIL), (BRAND_URL, BRAND_URL)):
+            l = tk.Label(footer, text=text, bg=BG, fg=TEXT_DIM, font=(UI_FONT, 8), cursor="hand2")
+            l.pack(side="right", padx=(0, 18 if target.startswith("mailto") else 12))
+            l.bind("<Button-1>", lambda e, t=target: webbrowser.open(t))
+            l.bind("<Enter>", lambda e, w=l: w.config(fg=ACCENT2))
+            l.bind("<Leave>", lambda e, w=l: w.config(fg=TEXT_DIM))
+
+    def _build_header(self):
+        top = tk.Frame(self, bg=BG); top.pack(fill="x", padx=18, pady=(12, 8))
+        title = tk.Frame(top, bg=BG); title.pack(side="left")
+        tk.Label(title, text="PC Monitor Sender", bg=BG, fg=TEXT,
+                 font=(UI_FONT, 15, "bold")).pack(anchor="w")
+        self._subtitle = tk.Label(title, text="Live PC stats on your LCD screens", bg=BG,
+                                  fg=TEXT_DIM, font=(UI_FONT, 9))
+        self._subtitle.pack(anchor="w")
+
+        right = tk.Frame(top, bg=BG); right.pack(side="right")
+        FlatButton(right, "?", self._show_about, bg=BG3, fg=TEXT_DIM,
+                   font=(UI_FONT, 10, "bold"), padx=10).pack(side="right", padx=(6, 0))
         if TRAY_OK:
-            tk.Button(top, text="⊖  Minimize to Tray",
-                      bg=BG3, fg=TEXT_DIM, font=("Segoe UI", 8),
-                      relief="flat", padx=8, pady=3, cursor="hand2",
-                      command=self._on_close).pack(side="right", padx=(0,4))
-        else:
-            tk.Button(top, text="⊖  Minimize to Tray (needs pystray)",
-                      bg=BG3, fg=BORDER, font=("Segoe UI", 8),
-                      relief="flat", padx=8, pady=3, cursor="hand2",
-                      command=lambda: self._append_log(
-                          "[WARN] Install pystray + Pillow for system tray:  pip install pystray Pillow")
-                      ).pack(side="right", padx=(0,4))
-        tk.Button(top, text="?",
-                  bg=BG3, fg=TEXT_DIM, font=("Segoe UI", 9, "bold"),
-                  relief="flat", width=3, pady=3, cursor="hand2",
-                  command=self._show_about).pack(side="right", padx=(0,4))
-
-        self._build_footer()   # footer sits at the very bottom
-        nb = ttk.Notebook(self); nb.pack(fill="both", expand=True, padx=10, pady=(0,4))
-        dash = tk.Frame(nb, bg=BG); nb.add(dash, text="  Dashboard  ")
-
-        self._build_dashboard(dash)
+            FlatButton(right, "Hide to tray", self._on_close, bg=BG3, fg=TEXT_DIM).pack(side="right", padx=(6, 0))
+        self._run_btn = FlatButton(right, "▶  Start", self._toggle_run, bg=GREEN, fg=BG,
+                                   hover=_blend(GREEN, "#ffffff", 0.8),
+                                   font=(UI_FONT, 10, "bold"), padx=22, pady=7)
+        self._run_btn.pack(side="right", padx=(12, 0))
+        pill = tk.Frame(right, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        pill.pack(side="right")
+        self._status_dot = tk.Label(pill, text="●", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 11))
+        self._status_dot.pack(side="left", padx=(10, 2), pady=3)
+        self._status_lbl = tk.Label(pill, text="Stopped", bg=BG2, fg=TEXT, font=(UI_FONT, 9))
+        self._status_lbl.pack(side="left", padx=(0, 12))
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  TAB 1 -- DASHBOARD
+    #  DASHBOARD TAB
     # ══════════════════════════════════════════════════════════════════════════
     def _build_dashboard(self, parent):
-        parent.columnconfigure(0, weight=3, minsize=320)
-        parent.columnconfigure(1, weight=4, minsize=380)
-        parent.rowconfigure(0, weight=3)   # stats (taller)
-        parent.rowconfigure(1, weight=2)   # log
-        parent.rowconfigure(2, weight=0)   # button bar (fixed height)
-        self._build_settings(parent)
-        self._build_stats(parent)
-        self._build_log(parent)
-        # ── Fixed Start / Stop bar ────────────────────────────────────────────
-        bf = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
-        bf.grid(row=2, column=0, sticky="ew", padx=(0,6), pady=(0,6))
-        self._start_btn = tk.Button(bf, text="▶  Start", bg=GREEN, fg="#1a1b26",
-                                     font=("Segoe UI",10,"bold"), relief="flat",
-                                     padx=20, pady=8, cursor="hand2", command=self._start)
-        self._start_btn.pack(side="left", padx=10, pady=6)
-        self._stop_btn = tk.Button(bf, text="■  Stop", bg=BG3, fg=TEXT_DIM,
-                                    font=("Segoe UI",10,"bold"), relief="flat",
-                                    padx=20, pady=8, state="disabled", cursor="hand2",
-                                    command=self._stop)
-        self._stop_btn.pack(side="left")
+        parent.columnconfigure(0, weight=5, uniform="dash")
+        parent.columnconfigure(1, weight=3, uniform="dash")
+        parent.rowconfigure(0, weight=1)
+        grid = tk.Frame(parent, bg=BG)
+        grid.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=16)
+        for i in range(2):
+            grid.columnconfigure(i, weight=1, uniform="cards")
+            grid.rowconfigure(i, weight=1, uniform="cards")
+        self._card_cpu = MetricCard(grid, "CPU", ACCENT)
+        self._card_gpu = MetricCard(grid, "GPU", ACCENT2)
+        self._card_ram = MetricCard(grid, "MEMORY", GREEN)
+        self._card_net = NetCard(grid)
+        for card, (r, c) in ((self._card_cpu, (0, 0)), (self._card_gpu, (0, 1)),
+                             (self._card_ram, (1, 0)), (self._card_net, (1, 1))):
+            card.grid(row=r, column=c, sticky="nsew", padx=6, pady=6)
 
-    # ── SETTINGS (left column) ────────────────────────────────────────────────
-    def _build_settings(self, parent):
-        f = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
-        f.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0,6), pady=(6,0))
-        f.columnconfigure(1, weight=1)
+        side = tk.Frame(parent, bg=BG)
+        side.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=22)
+        side.rowconfigure(1, weight=1); side.columnconfigure(0, weight=1)
+        self._screens_card = Card(side, "Your screens", "live preview")
+        self._screens_card.grid(row=0, column=0, sticky="new")
+        self._screens_box = tk.Frame(self._screens_card.body, bg=BG2)
+        self._screens_box.pack(fill="x")
+        self._preview_widgets = []      # [(addr, kind, LCDPreview, caption)]
 
-        row = 0
-        def lbl(t, r):
-            tk.Label(f, text=t, bg=BG2, fg=TEXT_DIM, font=("Segoe UI",9), anchor="w").grid(
-                row=r, column=0, sticky="w", padx=(10,4), pady=4)
-        def ent(r, val, w=14):
-            v = tk.StringVar(value=val)
-            tk.Entry(f, textvariable=v, bg=BG3, fg=TEXT, insertbackground=TEXT, relief="flat",
-                     font=("Consolas",10), width=w, highlightbackground=BORDER, highlightthickness=1
-                     ).grid(row=r, column=1, sticky="ew", padx=(0,10), pady=4)
-            return v
+        act = Card(side, "Activity")
+        act.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        FlatButton(act.header, "Full log →", lambda: self._nb.select(3), bg=BG2,
+                   fg=ACCENT, font=(UI_FONT, 8), padx=4, pady=0).pack(side="right")
+        self._activity = tk.Text(act.body, bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9), height=6,
+                                 relief="flat", wrap="word", state="disabled", cursor="arrow",
+                                 highlightthickness=0)
+        self._activity.pack(fill="both", expand=True)
+        for tag, col in (("err", RED), ("ok", GREEN), ("warn", YELLOW), ("info", TEXT_DIM)):
+            self._activity.tag_config(tag, foreground=col)
+        self._rebuild_previews()
 
-        # ── Connection ────────────────────────────────────────────────────────
-        tk.Label(f, text="Connection", bg=BG2, fg=TEXT,
-                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=2,
-                                                     sticky="w", padx=10, pady=(10,2)); row+=1
-        # ── COM Port dropdown ─────────────────────────────────────────────────
-        lbl("COM Port", row)
-        port_frame = tk.Frame(f, bg=BG2)
-        port_frame.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
-        port_frame.columnconfigure(0, weight=1)
-        self._port_var = tk.StringVar(value="COM10")
-        self._port_cb = ttk.Combobox(
-            port_frame, textvariable=self._port_var,
-            font=("Consolas", 10), state="normal", width=36)
-        self._port_cb.pack(side="left", fill="x", expand=True)
-        tk.Button(port_frame, text="⟳", bg=BG3, fg=TEXT,
-                  font=("Segoe UI", 10), relief="flat", padx=6,
-                  command=self._refresh_ports,
-                  cursor="hand2").pack(side="left", padx=(4, 0))
-        self._port_cb.bind("<<ComboboxSelected>>", self._on_port_selected)
-        row+=1
-        # ── Pin selected port as the boot default ─────────────────────────────
-        self._pin_port_var = tk.BooleanVar(value=False)
-        self._pin_cb = tk.Checkbutton(
-            f, variable=self._pin_port_var, command=self._toggle_pin_port,
-            text="  📌 Pin selected port as boot default",
-            bg=BG2, fg=TEXT_DIM, selectcolor=BG3, activebackground=BG2,
-            activeforeground=TEXT, font=("Segoe UI", 8), anchor="w",
-            highlightthickness=0, bd=0)
-        self._pin_cb.grid(row=row, column=1, sticky="w", padx=(0,10), pady=(0,2))
-        row+=1
-        self.after(100, self._refresh_ports)   # populate on startup
-        lbl("Baud Rate", row); self._baud_var = ent(row, "115200", 10); row+=1
+    def _update_dashboard(self, s):
+        cpu_t, gpu_t = s.get("cpu_temp", -1), s.get("gpu_temp", -1)
+        self._card_cpu.update_values(s["cpu"], f"{s['cpu']:.0f}%",
+                                     f"{psutil.cpu_count() or '?'} threads" if PSUTIL_OK else "", cpu_t)
+        vm, vt = s.get("vram_mb", -1), s.get("vram_total_mb", -1)
+        if vm >= 0 and vt > 0:
+            vtxt = f"VRAM {vm / 1024:.1f} / {vt / 1024:.0f} GB"
+        elif vm >= 0:
+            vtxt = f"VRAM {vm / 1024:.1f} GB"
+        else:
+            vtxt = "VRAM n/a"
+        self._card_gpu.update_values(s["gpu"], f"{s['gpu']:.0f}%", vtxt, gpu_t)
+        self._card_ram.update_values(s["ram"], f"{s['ram']:.0f}%",
+                                     f"{s['ram_mb'] / 1024:.1f} of {s['ram_total_mb'] / 1024:.0f} GB used")
+        self._card_net.update_values(s["dl_kb"], s["ul_kb"], s.get("link_speed"))
+        if self._tray_icon is not None:
+            try:
+                t = lambda v: f" {v:.0f}°C" if v is not None and v >= 0 else ""
+                self._tray_icon.title = (f"PC Monitor Sender\nCPU {s['cpu']:.0f}%{t(cpu_t)}  "
+                                         f"GPU {s['gpu']:.0f}%{t(gpu_t)}\nRAM {s['ram']:.0f}%")[:127]
+            except Exception:
+                pass
 
-        # ── LHM DLL path + browse ─────────────────────────────────────────────
-        lbl("LHM DLL", row)
-        df = tk.Frame(f, bg=BG2); df.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
-        df.columnconfigure(0, weight=1)
-        self._lhm_var = tk.StringVar(value=_default_dll_path())
-        tk.Entry(df, textvariable=self._lhm_var, bg=BG3, fg=TEXT, insertbackground=TEXT,
-                 relief="flat", font=("Consolas",8), highlightbackground=BORDER,
-                 highlightthickness=1).grid(row=0, column=0, sticky="ew")
-        tk.Button(df, text="...", bg=BG3, fg=TEXT, relief="flat", font=("Segoe UI",9), padx=4,
-                  command=self._browse_dll).grid(row=0, column=1, padx=(4,0))
-        # DLL status indicator -- updates whenever path changes
-        self._dll_status_var = tk.StringVar()
-        self._dll_status_lbl = tk.Label(f, textvariable=self._dll_status_var,
-                                         bg=BG2, font=("Segoe UI", 8), anchor="w")
-        self._dll_status_lbl.grid(row=row+1, column=0, columnspan=2,
-                                   sticky="w", padx=12, pady=(0, 2))
-        # Admin warning row
-        self._admin_lbl = tk.Label(f,
-            text="⚠  Run as Administrator for temperatures",
-            bg=BG2, fg=YELLOW, font=("Segoe UI", 8), anchor="w")
-        self._admin_lbl.grid(row=row+2, column=0, columnspan=2,
-                              sticky="w", padx=12, pady=(0, 4))
-        self._lhm_var.trace_add("write", lambda *_: self._check_dll())
-        self.after(100, self._check_dll)   # initial check after UI is built
-        self.after(150, self._check_admin)
-        row+=3
+    # ── screen previews ───────────────────────────────────────────────────────
+    def _screen_list(self):
+        """[(addr or None, kind)] in the firmware's screen order. The board probes
+        0x27 down to 0x20, then 0x3F down to 0x38 (PCF8574 / PCF8574A backpacks)."""
+        if not self._lcd_types:
+            return [(None, "1602")]
+        def scan_pos(a):
+            n = int(a, 16)
+            return (0, 0x27 - n) if n <= 0x27 else (1, 0x3F - n)
+        return sorted(self._lcd_types.items(), key=lambda kv: scan_pos(kv[0]))
 
-        # LHM Downloader card
-        dl_frame = tk.Frame(f, bg=BG3, padx=8, pady=6)
-        dl_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,4))
-        dl_frame.columnconfigure(1, weight=1)
-        row+=1
+    def _rebuild_previews(self):
+        if not hasattr(self, "_screens_box"):
+            return
+        for w in self._screens_box.winfo_children():
+            w.destroy()
+        self._preview_widgets = []
+        screens = self._screen_list()
+        for i, (addr, kind) in enumerate(screens):
+            box = tk.Frame(self._screens_box, bg=BG2); box.pack(fill="x", pady=(0, 10))
+            cap = tk.Label(box, bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8), anchor="w")
+            cap.pack(fill="x")
+            cols, rows = (20, 4) if kind == "2004" else (16, 2)
+            lcd = LCDPreview(box, cols, rows); lcd.pack(anchor="w", pady=(2, 0))
+            self._preview_widgets.append((addr, kind, lcd, cap))
+        if screens == [(None, "1602")]:
+            tk.Label(self._screens_box, bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8), justify="left",
+                     wraplength=300, anchor="w",
+                     text="No screens reported yet. Press Start and the board lists the "
+                          "screens it finds; until then this shows a 16×2 example.").pack(fill="x")
+        self._render_previews()
 
-        hf = tk.Frame(dl_frame, bg=BG3); hf.grid(row=0, column=0, columnspan=2, sticky="w")
-        tk.Label(hf, text="⬇", bg=BG3, fg=ACCENT, font=("Segoe UI",11)).pack(side="left")
-        tk.Label(hf, text="  LibreHardwareMonitor", bg=BG3, fg=TEXT,
-                 font=("Segoe UI",9,"bold")).pack(side="left")
-        tk.Label(hf, text="  -- needed for CPU/GPU temperatures",
-                 bg=BG3, fg=TEXT_DIM, font=("Segoe UI",8)).pack(side="left")
+    def _render_previews(self):
+        s = self._latest_stats or {"cpu": 0, "ram": 0, "gpu": 0, "cpu_temp": -1, "gpu_temp": -1,
+                                   "ram_mb": 0, "ram_total_mb": 0, "vram_mb": -1,
+                                   "vram_total_mb": -1, "dl_kb": 0, "ul_kb": 0, "link_speed": 1000}
+        pages = self.get_page_order() or [0]
+        per_screen = distribute_pages(len(self._preview_widgets), pages)
+        for i, (addr, kind, lcd, cap) in enumerate(self._preview_widgets):
+            mine = per_screen[i] if i < len(per_screen) else []
+            name = f"Screen {i + 1}" + (f"  ·  {addr}" if addr else "") + f"  ·  {kind[:2]}×{kind[2:]}"
+            if not mine:
+                rows = ["", "  (no page)"]
+                name += "  ·  idle"
+            elif not self._latest_stats:
+                rows = ["  Waiting PC... "] if kind == "1602" else ["", "   Waiting for PC   ", "        ...", ""]
+            else:
+                rows = screen_rows(kind, mine, self._preview_step, s)
+            if mine:
+                name += "  ·  " + " → ".join(PAGE_NAMES[p] for p in mine)
+            cap.config(text=name)
+            lcd.set_rows(rows)
 
-        tk.Label(dl_frame, text="Folder:", bg=BG3, fg=TEXT_DIM,
-                 font=("Segoe UI",8)).grid(row=1, column=0, sticky="w", pady=(6,2))
-        self._lhm_dest_var = tk.StringVar(
-            value=os.path.dirname(_default_dll_path()))
-        dest_row = tk.Frame(dl_frame, bg=BG3)
-        dest_row.grid(row=1, column=1, sticky="ew", pady=(6,2), padx=(4,0))
-        dest_row.columnconfigure(0, weight=1)
-        tk.Entry(dest_row, textvariable=self._lhm_dest_var, bg=BG, fg=TEXT_DIM,
-                 insertbackground=TEXT, relief="flat", font=("Consolas",7),
-                 highlightbackground=BORDER, highlightthickness=1,
-                 state="readonly").grid(row=0, column=0, sticky="ew")
-        tk.Button(dest_row, text="...", bg=BG3, fg=TEXT_DIM, relief="flat",
-                  font=("Segoe UI",8), padx=3,
-                  command=self._browse_lhm_dest).grid(row=0, column=1, padx=(3,0))
+    def _tick_preview(self):
+        """Advance the rotating pages at the configured page delay, like the board."""
+        self._preview_step += 1
+        try:
+            self._render_previews()
+        except Exception:
+            pass
+        self.after(max(500, int(self._delay_var.get())), self._tick_preview)
 
-        self._dl_progress = ttk.Progressbar(dl_frame, mode="determinate", maximum=100)
-        self._dl_progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6,2))
-        self._dl_status_var = tk.StringVar(value="Download the latest release from GitHub")
-        self._dl_status_lbl = tk.Label(dl_frame, textvariable=self._dl_status_var,
-                                        bg=BG3, fg=TEXT_DIM, font=("Consolas",7), anchor="w")
-        self._dl_status_lbl.grid(row=3, column=0, columnspan=2, sticky="ew")
+    # ══════════════════════════════════════════════════════════════════════════
+    #  DISPLAY TAB
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_display_tab(self, parent):
+        parent.columnconfigure(0, weight=1, uniform="disp")
+        parent.columnconfigure(1, weight=1, uniform="disp")
+        left = tk.Frame(parent, bg=BG); left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=16)
+        right = tk.Frame(parent, bg=BG); right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
 
-        self._dl_btn = tk.Button(
-            dl_frame, text="⬇  Download & Install Latest Release",
-            bg=ACCENT, fg="#1a1b26", font=("Segoe UI",9,"bold"),
-            relief="flat", padx=10, pady=5, cursor="hand2",
-            command=self._start_lhm_download)
-        self._dl_btn.grid(row=4, column=0, columnspan=2, pady=(8,0), sticky="ew")
-
-        # ── LHM Downloader ────────────────────────────────────────────────────
-        ttk.Separator(f, orient="horizontal").grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=6); row+=1
-
-        # ── Screen Page Order ─────────────────────────────────────────────────
-        tk.Label(f, text="Screen Page Order", bg=BG2, fg=TEXT,
-                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=2,
-                                                     sticky="w", padx=10, pady=(0,2)); row+=1
-        tk.Label(f, text="  ☑ enable  ·  ▲▼ reorder  ·  disabled rows are skipped",
-                 bg=BG2, fg=TEXT_DIM, font=("Segoe UI", 7)).grid(
-            row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0,4)); row+=1
-
-        # Page colours
+        pages = Card(left, "Pages", "what the screens show, in order")
+        pages.pack(fill="x")
         self._page_colors = {"CPU": ACCENT, "GPU": ACCENT2, "RAM": GREEN, "NET": YELLOW}
-        # (page_id, name, enabled_BooleanVar)
+        self._page_desc = {"CPU": "Usage and temperature", "GPU": "Usage, VRAM and temperature",
+                           "RAM": "Usage and used / total", "NET": "Download and upload speed"}
         self._page_order = [
             (0, "CPU", tk.BooleanVar(value=True)),
             (1, "GPU", tk.BooleanVar(value=True)),
             (2, "RAM", tk.BooleanVar(value=True)),
             (3, "NET", tk.BooleanVar(value=False)),
         ]
-        self._order_frame = tk.Frame(f, bg=BG2)
-        self._order_frame.grid(row=row, column=0, columnspan=2,
-                                sticky="ew", padx=10, pady=(0,4)); row+=1
-        self._order_frame.columnconfigure(0, weight=1)
+        self._order_frame = tk.Frame(pages.body, bg=BG2); self._order_frame.pack(fill="x")
+        tk.Label(pages.body, bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8), justify="left", anchor="w",
+                 wraplength=420, text="Each enabled page gets its own screen. If there are more pages "
+                 "than screens, the last screen rotates through the rest.").pack(fill="x", pady=(8, 0))
         self._rebuild_order_rows()
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=6); row+=1
-
-        # ── Page Delay ────────────────────────────────────────────────────────
-        tk.Label(f, text="Page Delay", bg=BG2, fg=TEXT,
-                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=2,
-                                                     sticky="w", padx=10, pady=(0,2)); row+=1
-        lbl("Delay", row)
-        sf = tk.Frame(f, bg=BG2); sf.grid(row=row, column=1, sticky="ew", padx=(0,10), pady=4)
+        rot = Card(left, "Rotation", "how long each page stays up")
+        rot.pack(fill="x", pady=(12, 0))
+        rf = tk.Frame(rot.body, bg=BG2); rf.pack(fill="x")
         self._delay_var = tk.IntVar(value=6000)
-        tk.Scale(sf, from_=1000, to=15000, resolution=500, orient="horizontal",
-                 variable=self._delay_var, bg=BG2, fg=TEXT, troughcolor=BG3,
-                 highlightthickness=0, activebackground=ACCENT, showvalue=False,
-                 command=lambda _: self._dlbl.config(
-                     text=f"{self._delay_var.get()/1000:.1f} s")
-                 ).pack(side="left", fill="x", expand=True)
-        self._dlbl = tk.Label(sf, text="6.0 s", bg=BG2, fg=ACCENT2,
-                               font=("Consolas",9), width=5)
-        self._dlbl.pack(side="left", padx=(4,0))
-        row+=1
+        self._dlbl = tk.Label(rf, text="6.0 s", bg=BG2, fg=TEXT, font=(UI_FONT, 11, "bold"), width=6)
+        self._dlbl.pack(side="right")
+        ttk.Scale(rf, from_=1000, to=15000, orient="horizontal", variable=self._delay_var,
+                  command=lambda _: self._on_delay_changed()).pack(side="left", fill="x", expand=True)
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=6); row+=1
-
-        # ── LCD Type Configuration ────────────────────────────────────────────
-        self._build_lcd_config(f, row); row+=1
-
-        # (Start/Stop buttons are in the fixed bottom bar built by _build_dashboard)
-
-    # ── LCD TYPE CONFIGURATION SECTION ───────────────────────────────────────
-    def _build_lcd_config(self, parent, start_row):
-        """Builds the LCD Types section inside the settings frame."""
-        # Header row: title + Identify button on the right
-        hdr = tk.Frame(parent, bg=BG2)
-        hdr.grid(row=start_row, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,4))
-        tk.Label(hdr, text="LCD Display Types", bg=BG2, fg=TEXT,
-                 font=("Segoe UI", 9, "bold")).pack(side="left")
-        self._ident_btn = tk.Button(
-            hdr, text="⊙  Identify Screens",
-            bg=BG3, fg=TEXT_DIM,
-            font=("Segoe UI", 8), relief="flat", padx=8, pady=2,
-            cursor="hand2", command=self._identify_screens)
+        scr = Card(right, "Screens", "reported by the board when it starts")
+        scr.pack(fill="x")
+        self._ident_btn = FlatButton(scr.header, "Identify screens", self._identify_screens,
+                                     bg=BG3, fg=TEXT, font=(UI_FONT, 8), padx=10, pady=3)
         self._ident_btn.pack(side="right")
+        self._lcd_cfg_inner = tk.Frame(scr.body, bg=BG2); self._lcd_cfg_inner.pack(fill="x")
+        self._lcd_hint_lbl = tk.Label(scr.body, bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8), justify="left",
+                                      anchor="w", wraplength=420,
+                                      text="No screens yet. Press Start: the board scans its I²C bus and "
+                                           "every screen it finds shows up here. Set each one to 16×2 or 20×4.")
+        self._lcd_hint_lbl.pack(fill="x", pady=(4, 0))
+        tk.Label(scr.body, bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8), justify="left", anchor="w",
+                 wraplength=420, text="Identify makes every screen show its number for a few "
+                                      "seconds, so you can tell which address is which.").pack(fill="x", pady=(8, 0))
 
-        # Container frame that holds the dynamic per-LCD rows
-        container = tk.Frame(parent, bg=BG2)
-        container.grid(row=start_row, column=0, columnspan=2,
-                        sticky="ew", padx=10, pady=(26,0))
-        container.columnconfigure(0, weight=1)
-        self._lcd_hint_lbl = None
+    def _on_delay_changed(self):
+        snapped = int(round(self._delay_var.get() / 500.0) * 500)   # 0.5 s steps
+        if snapped != self._delay_var.get():
+            self._delay_var.set(snapped)
+        self._dlbl.config(text=f"{self._delay_var.get() / 1000:.1f} s")
+        self._settings_changed()
 
-        # The inner frame where per-LCD rows will be added
-        self._lcd_cfg_inner = tk.Frame(container, bg=BG2)
-        self._lcd_cfg_inner.pack(fill="x")
+    def _rebuild_order_rows(self):
+        for w in self._order_frame.winfo_children():
+            w.destroy()
+        screen_no = 0
+        n = len(self._page_order)
+        for idx, (pid, name, var) in enumerate(self._page_order):
+            on = var.get()
+            if on:
+                screen_no += 1
+            row = tk.Frame(self._order_frame, bg=BG3 if on else BG2,
+                           highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", pady=3)
+            rbg = row["bg"]
+            tk.Checkbutton(row, variable=var, bg=rbg, activebackground=rbg, selectcolor=BG,
+                           fg=TEXT, relief="flat", bd=0, highlightthickness=0,
+                           command=self._on_pages_changed).pack(side="left", padx=(8, 2))
+            color = self._page_colors[name] if on else BORDER
+            tk.Label(row, text=f" {name} ", bg=color, fg=BG if on else TEXT_DIM,
+                     font=(UI_FONT, 9, "bold"), width=5).pack(side="left", padx=6, pady=8)
+            txt = tk.Frame(row, bg=rbg); txt.pack(side="left", fill="x", expand=True)
+            tk.Label(txt, text=self._page_desc[name], bg=rbg, fg=TEXT if on else TEXT_DIM,
+                     font=(UI_FONT, 9), anchor="w").pack(fill="x")
+            tk.Label(txt, text=f"Position {screen_no}" if on else "Hidden", bg=rbg, fg=TEXT_DIM,
+                     font=(UI_FONT, 8), anchor="w").pack(fill="x")
+            btns = tk.Frame(row, bg=rbg); btns.pack(side="right", padx=8)
+            for sym, d, ok in (("▲", -1, idx > 0), ("▼", 1, idx < n - 1)):
+                b = FlatButton(btns, sym, (lambda i=idx, dd=d: self._move_page(i, dd)) if ok else None,
+                               bg=BG2 if on else BG3, fg=TEXT if ok else BORDER,
+                               font=(UI_FONT, 8), padx=8, pady=1)
+                b.style(enabled=ok)
+                b.pack(side="left", padx=1)
 
+    def _on_pages_changed(self):
+        self._rebuild_order_rows()
+        self._rebuild_previews()
+        self._settings_changed()
+
+    def _move_page(self, idx, direction):
+        other = idx + direction
+        if 0 <= other < len(self._page_order):
+            self._page_order[idx], self._page_order[other] = self._page_order[other], self._page_order[idx]
+            self._on_pages_changed()
+
+    def get_page_order(self):
+        """Ordered list of enabled page IDs e.g. [2, 1, 0]."""
+        return [pid for pid, _, v in self._page_order if v.get()]
+
+    def _settings_changed(self):
+        """Page/delay/screen changes apply live: restart streaming with the new config."""
+        self._save_settings()
+        if self._running and self._thread:
+            self._thread.cfg.update(self._run_cfg())
+            self._thread.page_order = self._thread.cfg["page_order"] or [0]
+            self._thread.mask = sum(1 << i for i in self._thread.page_order)
+
+    # ── screens list ──────────────────────────────────────────────────────────
     def _add_lcd_row(self, addr: str):
-        """Add a new LCD type row for addr (e.g. '0x27') if not already present."""
+        """Add a screen row for addr (e.g. '0x27') if not already present."""
         addr = addr.upper()
-        if not addr.startswith("0X"):
-            addr = "0x" + addr
+        addr = "0x" + addr[2:] if addr.startswith("0X") else "0x" + addr
         if addr in self._lcd_type_vars:
-            return  # already shown
-
-        # Default to 1602
+            return
         var = tk.StringVar(value=self._lcd_types.get(addr, "1602"))
         self._lcd_type_vars[addr] = var
         self._lcd_types[addr] = var.get()
-        var.trace_add("write", lambda *_, a=addr, v=var: self._on_lcd_type_changed(a, v))
+        if self._lcd_hint_lbl is not None:
+            self._lcd_hint_lbl.pack_forget()
 
-        row_f = tk.Frame(self._lcd_cfg_inner, bg=BG3)
-        row_f.pack(fill="x", pady=1, padx=0)
+        row = tk.Frame(self._lcd_cfg_inner, bg=BG3, highlightbackground=BORDER, highlightthickness=1)
+        row.pack(fill="x", pady=3)
+        tk.Label(row, text=addr, bg=BG3, fg=LCD_ON, font=(MONO_FONT, 10, "bold"),
+                 width=6).pack(side="left", padx=(10, 6), pady=8)
+        seg = tk.Frame(row, bg=BG3); seg.pack(side="left")
+        buttons = {}
 
-        # Address badge
-        tk.Label(row_f, text=addr, bg=BG3, fg=LCD_ON,
-                 font=("Consolas", 9, "bold"), width=6, anchor="w",
-                 padx=4).pack(side="left")
+        def pick(kind, a=addr, v=var):
+            v.set(kind)
+            for k, b in buttons.items():
+                b.style(bg=ACCENT if k == kind else BG2, fg=BG if k == kind else TEXT_DIM)
+            self._lcd_types[a] = kind
+            self._rebuild_previews()
+            self._settings_changed()
 
-        # Type selector
-        om = tk.OptionMenu(row_f, var, "1602", "2004")
-        om.config(bg=BG3, fg=TEXT, activebackground=BG2, activeforeground=ACCENT,
-                  relief="flat", font=("Segoe UI", 9), highlightthickness=0,
-                  indicatoron=True, bd=0)
-        om["menu"].config(bg=BG2, fg=TEXT, font=("Segoe UI", 9))
-        om.pack(side="left", padx=6)
+        for kind, label in (("1602", "16×2"), ("2004", "20×4")):
+            buttons[kind] = FlatButton(seg, label, lambda k=kind: pick(k), font=(UI_FONT, 8, "bold"),
+                                       padx=10, pady=2)
+            buttons[kind].pack(side="left", padx=(0, 2))
+        var.trace_add("write", lambda *_, a=addr, v=var: self._lcd_types.__setitem__(a, v.get()))
 
-        # Type badge (updates when var changes)
-        badge = tk.Label(row_f, text="1602", bg=BG3, fg=ACCENT2,
-                          font=("Segoe UI", 8))
-        badge.pack(side="left")
-
-        def update_badge(*_, b=badge, v=var):
-            t = v.get()
-            b.config(text=t, fg=ACCENT if t == "2004" else ACCENT2)
-
-        var.trace_add("write", lambda *_, b=badge, v=var: update_badge())
-        update_badge()
-
-        # Remove button
-        def remove(a=addr, r=row_f):
+        def remove(a=addr, r=row):
             self._lcd_type_vars.pop(a, None)
             self._lcd_types.pop(a, None)
             r.destroy()
-            if not self._lcd_type_vars and self._lcd_hint_lbl:
-                self._lcd_hint_lbl.pack(fill="x")
+            if not self._lcd_type_vars and self._lcd_hint_lbl is not None:
+                self._lcd_hint_lbl.pack(fill="x", pady=(4, 0))
+            self._rebuild_previews()
+            self._save_settings()
 
-        tk.Button(row_f, text="✕", bg=BG3, fg=TEXT_DIM,
-                  font=("Segoe UI", 8), relief="flat",
-                  command=remove).pack(side="right", padx=4)
+        FlatButton(row, "Forget", remove, bg=BG3, fg=TEXT_DIM, font=(UI_FONT, 8),
+                   padx=8, pady=2).pack(side="right", padx=8)
+        for k, b in buttons.items():
+            b.style(bg=ACCENT if k == var.get() else BG2, fg=BG if k == var.get() else TEXT_DIM)
+        row._pick = pick
+        self._rebuild_previews()
 
-    def _on_lcd_type_changed(self, addr: str, var: tk.StringVar):
-        self._lcd_types[addr] = var.get()
+    def _set_lcd_type(self, addr, kind):
+        addr = "0x" + addr.upper()[2:] if addr.upper().startswith("0X") else "0x" + addr.upper()
+        if addr not in self._lcd_type_vars:
+            self._add_lcd_row(addr)
+        for row in self._lcd_cfg_inner.winfo_children():
+            lbl = row.winfo_children()[0]
+            if lbl.cget("text") == addr and hasattr(row, "_pick"):
+                row._pick(kind)
 
-    def _clear_lcd_config(self):
-        for widget in self._lcd_cfg_inner.winfo_children():
-            widget.destroy()
-        self._lcd_type_vars.clear()
-        self._lcd_types.clear()
+    def _identify_screens(self):
+        """Ask the board to flash each screen's number."""
+        if not self._running or not self._thread:
+            self._log_event("[WARN] Start streaming first, then use Identify")
+            self._nb.select(1)
+            return
+        self._flags["ident"] = True
+        self._ident_btn.style(text="Identifying…", fg=YELLOW)
+        self.after(3500, lambda: self._ident_btn.style(text="Identify screens", fg=TEXT))
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-    def _cb(self, parent, label, row, default=True):
-        var = tk.BooleanVar(value=default)
-        tk.Checkbutton(parent, text=label, variable=var, bg=BG2, fg=TEXT,
-                        selectcolor=BG3, activebackground=BG2, activeforeground=TEXT,
-                        font=("Segoe UI",9), anchor="w", relief="flat", bd=0
-                        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=1)
-        return var
+    # ══════════════════════════════════════════════════════════════════════════
+    #  CONNECTION TAB
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_connection_tab(self, parent):
+        parent.columnconfigure(0, weight=1, uniform="conn")
+        parent.columnconfigure(1, weight=1, uniform="conn")
+        left = tk.Frame(parent, bg=BG); left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=16)
+        right = tk.Frame(parent, bg=BG); right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
 
+        ser = Card(left, "Board connection", "USB serial")
+        ser.pack(fill="x")
+        b = ser.body; b.columnconfigure(1, weight=1)
+        tk.Label(b, text="Port", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9)).grid(row=0, column=0, sticky="w", pady=6)
+        pf = tk.Frame(b, bg=BG2); pf.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        self._port_var = tk.StringVar(value="")
+        self._port_cb = ttk.Combobox(pf, textvariable=self._port_var, font=(MONO_FONT, 10))
+        self._port_cb.pack(side="left", fill="x", expand=True)
+        self._port_cb.bind("<<ComboboxSelected>>", self._on_port_selected)
+        FlatButton(pf, "⟳ Scan", self._refresh_ports, font=(UI_FONT, 9), padx=10, pady=3).pack(side="left", padx=(6, 0))
+        self._pin_port_var = tk.BooleanVar(value=False)
+        self._pin_cb = self._check(b, "Always use this port at boot", self._pin_port_var, self._toggle_pin_port)
+        self._pin_cb.grid(row=1, column=1, sticky="w", padx=(10, 0))
+        tk.Label(b, text="Baud rate", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 9)).grid(row=2, column=0, sticky="w", pady=6)
+        self._baud_var = tk.StringVar(value="115200")
+        ttk.Combobox(b, textvariable=self._baud_var, values=_COMMON_BAUDS, width=12,
+                     font=(MONO_FONT, 10)).grid(row=2, column=1, sticky="w", padx=(10, 0))
+        self._auto_reconnect_var = tk.BooleanVar(value=True)
+        self._check(b, "Reconnect automatically if the board is unplugged",
+                    self._auto_reconnect_var, self._save_settings).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.after(100, self._refresh_ports)
+
+        st = Card(left, "Startup")
+        st.pack(fill="x", pady=(12, 0))
+        self._startup_var = tk.BooleanVar(value=_startup_enabled())
+        self._check(st.body, "Start with Windows (hidden in the tray)", self._startup_var,
+                    self._toggle_startup).pack(anchor="w")
+        self._autostart_var = tk.BooleanVar(value=False)
+        self._check(st.body, "Start streaming as soon as the app opens", self._autostart_var,
+                    self._save_settings).pack(anchor="w", pady=(4, 0))
+
+        sen = Card(right, "Temperature sensors", "LibreHardwareMonitor")
+        sen.pack(fill="x")
+        b = sen.body
+        self._admin_lbl = tk.Label(b, bg=BG2, font=(UI_FONT, 9), anchor="w", justify="left", wraplength=440)
+        self._admin_lbl.pack(fill="x")
+        self._dll_status_var = tk.StringVar()
+        self._dll_status_lbl = tk.Label(b, textvariable=self._dll_status_var, bg=BG2, font=(UI_FONT, 9),
+                                        anchor="w", justify="left", wraplength=440)
+        self._dll_status_lbl.pack(fill="x", pady=(4, 8))
+
+        self._dl_btn = FlatButton(b, "⬇  Download LibreHardwareMonitor", self._start_lhm_download,
+                                  bg=ACCENT, fg=BG, hover=_blend(ACCENT, "#ffffff", 0.8),
+                                  font=(UI_FONT, 9, "bold"))
+        self._dl_btn.pack(anchor="w")
+        self._dl_progress = ttk.Progressbar(b, mode="determinate", maximum=100)
+        self._dl_status_var = tk.StringVar(value="")
+        self._dl_status_lbl = tk.Label(b, textvariable=self._dl_status_var, bg=BG2, fg=TEXT_DIM,
+                                       font=(UI_FONT, 8), anchor="w", justify="left", wraplength=440)
+
+        adv = tk.Frame(b, bg=BG2); adv.pack(fill="x", pady=(10, 0))
+        self._adv_open = tk.BooleanVar(value=False)
+        self._adv_btn = FlatButton(adv, "▸ Advanced", self._toggle_advanced, bg=BG2, fg=TEXT_DIM,
+                                   font=(UI_FONT, 8), padx=0, pady=0)
+        self._adv_btn.pack(anchor="w")
+        self._adv_body = tk.Frame(adv, bg=BG2)
+        self._adv_body.columnconfigure(1, weight=1)
+        tk.Label(self._adv_body, text="DLL file", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8)).grid(row=0, column=0, sticky="w", pady=4)
+        self._lhm_var = tk.StringVar(value=_default_dll_path())
+        tk.Entry(self._adv_body, textvariable=self._lhm_var, bg=BG3, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", font=(MONO_FONT, 8), highlightbackground=BORDER,
+                 highlightthickness=1).grid(row=0, column=1, sticky="ew", padx=6)
+        FlatButton(self._adv_body, "Browse", self._browse_dll, font=(UI_FONT, 8), padx=8, pady=2).grid(row=0, column=2)
+        tk.Label(self._adv_body, text="Download to", bg=BG2, fg=TEXT_DIM, font=(UI_FONT, 8)).grid(row=1, column=0, sticky="w", pady=4)
+        self._lhm_dest_var = tk.StringVar(value=os.path.dirname(_default_dll_path()))
+        tk.Entry(self._adv_body, textvariable=self._lhm_dest_var, bg=BG3, fg=TEXT_DIM, relief="flat",
+                 font=(MONO_FONT, 8), highlightbackground=BORDER, highlightthickness=1,
+                 readonlybackground=BG3, state="readonly").grid(row=1, column=1, sticky="ew", padx=6)
+        FlatButton(self._adv_body, "Browse", self._browse_lhm_dest, font=(UI_FONT, 8), padx=8, pady=2).grid(row=1, column=2)
+        FlatButton(self._adv_body, "Open data folder", self._open_data_dir, font=(UI_FONT, 8),
+                   padx=8, pady=2).grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+
+        self._lhm_var.trace_add("write", lambda *_: self._check_dll())
+        self.after(100, self._check_dll)
+        self.after(150, self._check_admin)
+
+    def _check(self, parent, text, var, command):
+        return tk.Checkbutton(parent, text="  " + text, variable=var, command=command, bg=BG2, fg=TEXT,
+                              selectcolor=BG, activebackground=BG2, activeforeground=TEXT,
+                              font=(UI_FONT, 9), anchor="w", highlightthickness=0, bd=0, cursor="hand2")
+
+    def _toggle_advanced(self):
+        self._adv_open.set(not self._adv_open.get())
+        if self._adv_open.get():
+            self._adv_body.pack(fill="x", pady=(6, 0)); self._adv_btn.style(text="▾ Advanced")
+        else:
+            self._adv_body.pack_forget(); self._adv_btn.style(text="▸ Advanced")
+
+    def _open_data_dir(self):
+        _ensure_data_dir()
+        try:
+            os.startfile(_DATA_DIR)          # Windows
+        except Exception:
+            import webbrowser
+            webbrowser.open("file://" + _DATA_DIR)
+
+    # ── ports ─────────────────────────────────────────────────────────────────
     def _scan_ports(self):
         """Return list of (device, label) tuples, sorted by port number.
-        label = "COM3 -- Arduino Nano (CH340)"  or just "COM3" if no description.
+        label = "COM3  ·  Arduino Nano (CH340)"  or just "COM3" if no description.
         """
         port_map = {}   # device -> description
-
-        # Method 1: pyserial -- best source, gives manufacturer descriptions
         try:
             import serial.tools.list_ports as lp
             for p in lp.comports():
                 desc = p.description or ""
-                # p.description already contains the port name sometimes, strip it
                 if desc.lower().startswith(p.device.lower()):
                     desc = desc[len(p.device):].strip(" -()")
+                if desc.endswith(f"({p.device})"):
+                    desc = desc[:-len(p.device) - 2].strip()
                 port_map[p.device] = desc
         except Exception:
             pass
-
-        # Method 2: Windows registry (port names only, no descriptions)
         try:
             import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"HARDWARE\DEVICEMAP\SERIALCOMM")
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
             i = 0
             while True:
                 try:
                     _, val, _ = winreg.EnumValue(key, i)
-                    if val not in port_map:
-                        port_map[val] = ""
+                    port_map.setdefault(val, "")
                     i += 1
                 except OSError:
                     break
@@ -1789,97 +2243,47 @@ class App(tk.Tk):
         except Exception:
             pass
 
-        # Method 3: brute-force probe COM1-COM32 (last resort)
-        if not port_map:
-            try:
-                import serial
-                for n in range(1, 33):
-                    name = f"COM{n}"
-                    try:
-                        s = serial.Serial(name); s.close()
-                        port_map[name] = ""
-                    except serial.SerialException as e:
-                        if "access" in str(e).lower() or "denied" in str(e).lower():
-                            port_map[name] = ""
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
         def sort_key(dev):
             num = dev[3:] if dev.upper().startswith("COM") else dev
-            return int(num) if num.isdigit() else 999
+            return (0, int(num)) if num.isdigit() else (1, dev)
 
         result = []
-        for dev in sorted(port_map.keys(), key=sort_key):
+        for dev in sorted(port_map, key=sort_key):
             desc = port_map[dev].strip()
-            label = f"{dev} -- {desc}" if desc and desc != dev else dev
-            result.append((dev, label))
+            result.append((dev, f"{dev}  ·  {desc}" if desc and desc != dev else dev))
         return result
 
     def _refresh_ports(self):
-        """Scan available COM ports and update the dropdown."""
-        entries = self._scan_ports()   # list of (device, label)
-        # Store device->label mapping so we can extract the raw port on connect
+        entries = self._scan_ports()
         self._port_labels = {dev: label for dev, label in entries}
-
-        labels  = [label for _, label  in entries]
-        devices = [dev   for dev, _    in entries]
-
+        labels = [label for _, label in entries]
+        devices = [dev for dev, _ in entries]
         self._port_cb["values"] = labels
-
-        def safe_log(msg):
-            try: self._append_log(msg)
-            except Exception: pass
-
-        # Figure out current raw device (might be "COM3" or full label)
-        current_raw = self._port_var.get().strip()
-        # Strip label back to raw port if needed
-        for dev, lbl in entries:
-            if current_raw == lbl:
-                current_raw = dev
-                break
-
+        current_raw = self._get_selected_port()
         if entries:
             if self._default_port and self._default_port in devices:
-                # Pinned boot port wins whenever it's connected.
                 self._port_var.set(self._port_labels[self._default_port])
             elif current_raw in devices:
-                # Refresh the display label in case it changed
                 self._port_var.set(self._port_labels[current_raw])
             else:
-                # Auto-select: prefer USB/Arduino ports over built-in COM ports
-                usb_keywords = ("usb", "arduino", "ch340", "ch341",
-                                "ftdi", "cp210", "cp2102", "serial device")
-                preferred = next(
-                    (lbl for dev, lbl in entries
-                     if any(k in lbl.lower() for k in usb_keywords)),
-                    labels[0])  # fallback to first if none match
-                self._port_var.set(preferred)
+                usb = ("usb", "arduino", "ch340", "ch341", "ftdi", "cp210", "serial device")
+                self._port_var.set(next((l for l in labels if any(k in l.lower() for k in usb)), labels[0]))
                 if self._default_port:
-                    safe_log(f"[WARN] Pinned boot port {self._default_port} "
-                             f"not connected -- auto-selected instead.")
-
-            safe_log(f"[INFO] COM ports found:")
-            for dev, lbl in entries:
-                marker = " ◄ selected" if self._port_var.get() == lbl else ""
-                safe_log(f"[INFO]   {lbl}{marker}")
+                    self._log_event(f"[WARN] Pinned boot port {self._default_port} not connected -- auto-selected instead.")
+            self._append_log(f"[INFO] COM ports: {', '.join(devices)}  (selected {self._get_selected_port()})")
         else:
-            safe_log("[WARN] No COM ports found -- is the Arduino plugged in?")
+            self._append_log("[WARN] No COM ports found -- is the board plugged in?")
+        self._update_pin_label()
 
     def _update_pin_label(self):
-        """Reflect the pinned-port state in the checkbox text/colour."""
         if not hasattr(self, "_pin_cb"):
             return
         if self._default_port:
-            self._pin_cb.config(
-                text=f"  📌 Boot default: {self._default_port}", fg=ACCENT)
+            self._pin_cb.config(text=f"  Always use {self._default_port} at boot", fg=ACCENT)
         else:
-            self._pin_cb.config(
-                text="  📌 Pin selected port as boot default", fg=TEXT_DIM)
+            self._pin_cb.config(text="  Always use this port at boot", fg=TEXT)
 
     def _toggle_pin_port(self):
-        """Pin/unpin the currently selected port as the boot default."""
         if self._pin_port_var.get():
             self._default_port = self._get_selected_port()
             self._append_log(f"[INFO] Boot default port pinned: {self._default_port}")
@@ -1890,67 +2294,53 @@ class App(tk.Tk):
         self._save_settings()
 
     def _on_port_selected(self, event=None):
-        """User picked a port from the dropdown -- follow it while pinned."""
         if self._pin_port_var.get():
             self._default_port = self._get_selected_port()
             self._update_pin_label()
-            self._save_settings()
+        self._save_settings()
 
     def _get_selected_port(self):
-        """Return the raw COM port device name from current dropdown selection."""
+        """Raw device name (COM3) from the dropdown text (label or typed)."""
         label = self._port_var.get().strip()
-        # Exact match in label map
-        for dev, lbl in getattr(self, "_port_labels", {}).items():
+        for dev, lbl in self._port_labels.items():
             if lbl == label:
                 return dev
-        # Fallback: if it looks like COMx already, use it directly
-        if label.upper().startswith("COM"):
-            return label.split(" ")[0]
-        return label
+        return label.split()[0] if label else ""
 
+    # ── LibreHardwareMonitor ─────────────────────────────────────────────────
     def _browse_dll(self):
-        p = filedialog.askopenfilename(
-            title="Select LibreHardwareMonitorLib.dll",
-            filetypes=[("DLL files","*.dll"),("All","*.*")])
+        p = filedialog.askopenfilename(title="Select LibreHardwareMonitorLib.dll",
+                                       filetypes=[("DLL files", "*.dll"), ("All", "*.*")])
         if p: self._lhm_var.set(p)
 
     def _browse_lhm_dest(self):
-        from tkinter import filedialog as fd
-        p = fd.askdirectory(title="Choose install folder for LibreHardwareMonitor")
+        p = filedialog.askdirectory(title="Choose install folder for LibreHardwareMonitor")
         if p: self._lhm_dest_var.set(p)
 
     def _check_dll(self):
-        """Check if the DLL exists at the current path and update the status label."""
         path = self._lhm_var.get().strip()
-        if not path:
-            self._dll_status_var.set("⚠  No path set")
-            self._dll_status_lbl.config(fg=YELLOW)
-        elif os.path.isfile(path):
-            size_kb = os.path.getsize(path) // 1024
-            self._dll_status_var.set(f"✓  Found  ({size_kb} KB)  --  {path}")
+        if path and os.path.isfile(path):
+            self._dll_status_var.set("✓  LibreHardwareMonitor is installed")
             self._dll_status_lbl.config(fg=GREEN)
-            # Also pre-fill the downloader destination to match
             self._lhm_dest_var.set(os.path.dirname(path))
+            self._dl_btn.style(text="Re-download", bg=BG3, fg=TEXT, hover=BORDER)
         else:
-            self._dll_status_var.set(f"✗  Not found  --  {path}")
+            self._dll_status_var.set("✗  Not installed. CPU and GPU temperatures will show as n/a.")
             self._dll_status_lbl.config(fg=RED)
+            self._dl_btn.style(text="⬇  Download LibreHardwareMonitor", bg=ACCENT, fg=BG,
+                               hover=_blend(ACCENT, "#ffffff", 0.8))
 
     def _check_admin(self):
         if _is_admin():
-            self._admin_lbl.config(
-                text="✓  Running as Administrator -- temperatures enabled",
-                fg=GREEN)
+            self._admin_lbl.config(text="✓  Running as administrator", fg=GREEN)
         else:
-            self._admin_lbl.config(
-                text="⚠  Not Administrator -- temperatures will show N/A  (right-click -> Run as administrator)",
-                fg=YELLOW)
+            self._admin_lbl.config(text="⚠  Not running as administrator, so temperatures can't be read. "
+                                        "Restart the app and accept the Windows prompt.", fg=YELLOW)
 
     def _dl_set_status(self, msg, color=None):
-        """Thread-safe status update."""
         def _update():
             self._dl_status_var.set(msg)
-            if color:
-                self._dl_status_lbl.config(fg=color)
+            if color: self._dl_status_lbl.config(fg=color)
         self.after(0, _update)
 
     def _dl_set_progress(self, pct):
@@ -1958,376 +2348,263 @@ class App(tk.Tk):
 
     def _dl_set_btn(self, text, state, bg=None):
         def _update():
-            self._dl_btn.config(text=text, state=state)
-            if bg: self._dl_btn.config(bg=bg)
+            self._dl_btn.style(text=text, enabled=(state != "disabled"), bg=bg)
+            if state != "disabled":
+                self._dl_progress.pack_forget()
         self.after(0, _update)
 
     def _maybe_prompt_lhm_download(self):
-        """On first run, if the LHM DLL is missing, offer to download it to the
-        default folder. Skipped when booting to tray or if previously dismissed."""
-        if self._start_minimized:
-            return
-        if getattr(self, "_lhm_prompt_dismissed", False):
+        """First run: offer to download LHM when it's missing (unless dismissed before)."""
+        if self._start_minimized or getattr(self, "_lhm_prompt_dismissed", False):
             return
         path = self._lhm_var.get().strip()
         if path and os.path.isfile(path):
             return
         dest = self._lhm_dest_var.get().strip() or _LHM_DIR
         from tkinter import messagebox
-        ans = messagebox.askyesno(
-            "Enable temperatures?",
-            "CPU/GPU temperatures need LibreHardwareMonitor, which isn't "
-            "installed yet.\n\n"
-            f"Download it now to:\n{dest}\n\n"
-            "(You can always do this later from the Settings tab.)",
-            parent=self)
-        if ans:
+        if messagebox.askyesno(
+                "Enable temperatures?",
+                "CPU/GPU temperatures need LibreHardwareMonitor, which isn't installed yet.\n\n"
+                f"Download it now to:\n{dest}\n\n(You can do this later from the Connection tab.)",
+                parent=self):
+            self._nb.select(2)
             self._start_lhm_download()
         else:
-            # Remember the choice so we don't nag on every launch.
             self._lhm_prompt_dismissed = True
             self._save_settings()
 
     def _start_lhm_download(self):
-        self._dl_btn.config(state="disabled", text="Downloading...")
+        self._dl_btn.style(text="Downloading…", enabled=False, bg=BG3, fg=TEXT_DIM)
         self._dl_progress.config(value=0)
-        self._dl_set_status("Checking GitHub for latest release...", TEXT_DIM)
+        self._dl_progress.pack(fill="x", pady=(8, 2))
+        self._dl_status_lbl.pack(fill="x")
+        self._dl_set_status("Checking GitHub for the latest release…", TEXT_DIM)
         threading.Thread(target=self._download_lhm_worker, daemon=True).start()
 
     def _download_lhm_worker(self):
         import ssl
         ctx = ssl.create_default_context()
-        dest_dir = self._lhm_dest_var.get().strip()
-
+        dest_dir = self._lhm_dest_var.get().strip() or _LHM_DIR
+        retry = "⬇  Download LibreHardwareMonitor"
         try:
-            # ── Step 1: resolve latest release via GitHub API ─────────────────
-            self._dl_set_status("Querying GitHub API...")
             api_url = "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+            req = urllib.request.Request(api_url, headers={"User-Agent": "PCMonitorGUI/1.1"})
             with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
                 release = _json.loads(resp.read().decode())
-
-            tag  = release.get("tag_name", "?")
+            tag = release.get("tag_name", "?")
             assets = release.get("assets", [])
-            zip_url = None
-            for a in assets:
-                name = a.get("name","").lower()
-                if name.endswith(".zip") and "libre" in name:
-                    zip_url = a["browser_download_url"]; break
-            # Fallback: find any zip asset
-            if not zip_url:
-                for a in assets:
-                    if a.get("name","").lower().endswith(".zip"):
-                        zip_url = a["browser_download_url"]; break
-
-            if not zip_url:
+            zips = [a for a in assets if a.get("name", "").lower().endswith(".zip")]
+            pick = next((a for a in zips if "libre" in a["name"].lower()), zips[0] if zips else None)
+            if not pick:
                 self._dl_set_status(f"✗ No zip found in release {tag}", RED)
-                self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
-                return
-
-            self._dl_set_status(f"Downloading {tag}...")
-            self._dl_set_progress(5)
-
-            # ── Step 2: download zip with progress ────────────────────────────
-            req2 = urllib.request.Request(zip_url, headers={"User-Agent": "PCMonitorGUI/1.0"})
+                self._dl_set_btn(retry, "normal", ACCENT); return
+            self._dl_set_status(f"Downloading {tag}…"); self._dl_set_progress(5)
+            req2 = urllib.request.Request(pick["browser_download_url"], headers={"User-Agent": "PCMonitorGUI/1.1"})
             with urllib.request.urlopen(req2, context=ctx, timeout=60) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
-                buf = io.BytesIO()
-                downloaded = 0
-                chunk = 8192
+                buf, done = io.BytesIO(), 0
                 while True:
-                    data = resp.read(chunk)
+                    data = resp.read(65536)
                     if not data: break
-                    buf.write(data)
-                    downloaded += len(data)
+                    buf.write(data); done += len(data)
                     if total > 0:
-                        pct = 5 + int(downloaded / total * 80)
-                        self._dl_set_progress(pct)
-                        self._dl_set_status(
-                            f"Downloading {tag}... {downloaded//1024} / {total//1024} KB")
-
-            self._dl_set_status("Extracting..."); self._dl_set_progress(88)
-
-            # ── Step 3: extract just the DLL ─────────────────────────────────
+                        self._dl_set_progress(5 + int(done / total * 80))
+                        self._dl_set_status(f"Downloading {tag}… {done // 1024} / {total // 1024} KB")
+            self._dl_set_status("Extracting…"); self._dl_set_progress(88)
             os.makedirs(dest_dir, exist_ok=True)
             buf.seek(0)
             dll_name = "LibreHardwareMonitorLib.dll"
-            found_dll = False
+            found = False
             with zipfile.ZipFile(buf) as zf:
                 for member in zf.namelist():
                     bname = os.path.basename(member)
-                    if not bname or not bname.lower().endswith(".dll"):
-                        continue
-                    data = zf.read(member)
-                    out_path = os.path.join(dest_dir, bname)
-                    with open(out_path, "wb") as fout:
-                        fout.write(data)
-                    if bname.lower() == dll_name.lower():
-                        found_dll = True
-                    else:
-                        self._append_log(f"[OK] Also extracted: {bname}")
-
-            if not found_dll:
+                    if bname and bname.lower().endswith(".dll"):
+                        with open(os.path.join(dest_dir, bname), "wb") as fout:
+                            fout.write(zf.read(member))
+                        found = found or bname.lower() == dll_name.lower()
+            if not found:
                 self._dl_set_status("✗ DLL not found inside zip", RED)
-                self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
-                return
-
-            # ── Step 4: update the DLL path field ─────────────────────────────
+                self._dl_set_btn(retry, "normal", ACCENT); return
             dll_path = os.path.join(dest_dir, dll_name)
             self.after(0, lambda p=dll_path: self._lhm_var.set(p))
-            self.after(50, self._check_dll)
             self._dl_set_progress(100)
-            self._dl_set_status(f"✓ Installed {tag}  ->  {dll_path}", GREEN)
-            self._dl_set_btn("✓  Installed -- click to re-download", "normal", GREEN)
-            self._append_log(f"[OK] LHM {tag} installed to {dll_path}")
-
+            self._dl_set_status(f"✓ Installed {tag}. Temperatures will show after the next Start.", GREEN)
+            self._dl_set_btn("Re-download", "normal", BG3)
+            self._log_q.put(f"[OK] LHM {tag} installed to {dll_path}")
         except urllib.error.URLError as e:
             self._dl_set_status(f"✗ Network error: {e.reason}", RED)
-            self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
+            self._dl_set_btn(retry, "normal", ACCENT)
         except Exception as e:
             self._dl_set_status(f"✗ Error: {e}", RED)
-            self._dl_set_btn("⬇  Download & Install Latest Release", "normal", ACCENT)
-
-    # ── STATS PANEL ───────────────────────────────────────────────────────────
-    def _build_stats(self, parent):
-        f = tk.LabelFrame(parent, text=" Live Stats ", bg=BG2, fg=ACCENT,
-                          font=("Segoe UI",10,"bold"), bd=0, relief="flat",
-                          highlightbackground=BORDER, highlightthickness=1)
-        f.grid(row=0, column=1, sticky="nsew", pady=(6,3))
-
-        def section(t):
-            tk.Label(f, text=f"  {t}", bg=BG2, fg=ACCENT2,
-                     font=("Segoe UI",9,"bold")).pack(fill="x", pady=(8,2))
-        def temp_row(lbl):
-            rf = tk.Frame(f, bg=BG2); rf.pack(fill="x", padx=8)
-            tk.Label(rf, text=lbl, bg=BG2, fg=TEXT_DIM, font=("Consolas",9),
-                     width=14, anchor="e").pack(side="left")
-            lb = TempLabel(rf, text="", bg=BG2, fg=TEXT_DIM, font=("Consolas",10))
-            lb.pack(side="left"); return lb
-        def info_row(lbl):
-            rf = tk.Frame(f, bg=BG2); rf.pack(fill="x", padx=8, pady=1)
-            tk.Label(rf, text=lbl, bg=BG2, fg=TEXT_DIM, font=("Consolas",9),
-                     width=14, anchor="e").pack(side="left")
-            lb = tk.Label(rf, text=" --", bg=BG2, fg=TEXT, font=("Consolas",10))
-            lb.pack(side="left"); return lb
-
-        section("CPU")
-        self._bar_cpu = StatBar(f, "CPU"); self._bar_cpu.pack(fill="x", padx=8, pady=1)
-        self._cpu_temp = temp_row("Temp")
-        section("GPU")
-        self._bar_gpu = StatBar(f, "GPU"); self._bar_gpu.pack(fill="x", padx=8, pady=1)
-        self._gpu_temp = temp_row("Temp")
-        self._vram = info_row("VRAM Used")
-        section("RAM")
-        self._bar_ram = StatBar(f, "RAM"); self._bar_ram.pack(fill="x", padx=8, pady=1)
-        self._ram_used = info_row("Used / Total")
-        section("Network")
-        self._bar_dl = StatBar(f, "DL"); self._bar_dl.pack(fill="x", padx=8, pady=1)
-        self._bar_ul = StatBar(f, "UL"); self._bar_ul.pack(fill="x", padx=8, pady=1)
-        self._link   = info_row("Link Speed")
-        tk.Frame(f, bg=BG2, height=8).pack()
+            self._dl_set_btn(retry, "normal", ACCENT)
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  TAB 2 -- LCD PAGE ORDER
+    #  LOG TAB
     # ══════════════════════════════════════════════════════════════════════════
-
-    def _identify_screens(self):
-        """Send IDENT command - Arduino flashes each screen with its number."""
-        if not self._running or not self._thread:
-            self._append_log("[WARN] Connect first, then use Identify")
-            return
-        # The monitor thread polls this flag and injects an IDENT frame.
-        self._thread._app_ident_pending = True
-        self._ident_btn.config(text="⊙  Identifying...", fg=YELLOW)
-        self.after(3500, lambda: self._ident_btn.config(
-            text="⊙  Identify Screens", fg=TEXT_DIM))
-
-    def _rebuild_order_rows(self):
-        """Rebuild the page-order rows inside the settings panel."""
-        for w in self._order_frame.winfo_children():
-            w.destroy()
-
-        desc = {
-            "CPU": "CPU usage + temperature",
-            "GPU": "GPU usage + VRAM + temperature",
-            "RAM": "RAM usage + used / total",
-            "NET": "Download / Upload speeds",
-        }
-
-        for idx, (pid, name, enabled_var) in enumerate(self._page_order):
-            enabled = enabled_var.get()
-            row_bg  = BG2 if enabled else BG3
-
-            row_f = tk.Frame(self._order_frame, bg=row_bg,
-                             highlightbackground=BORDER, highlightthickness=1)
-            row_f.pack(fill="x", pady=2)
-            row_f.columnconfigure(2, weight=1)
-
-            # Enable checkbox
-            cb = tk.Checkbutton(row_f, variable=enabled_var, bg=row_bg,
-                                activebackground=row_bg, relief="flat", bd=0,
-                                command=self._rebuild_order_rows)
-            cb.grid(row=0, column=0, padx=(6, 0))
-
-            # Screen label (only for enabled rows)
-            enabled_count = sum(1 for _, _, v in self._page_order[:idx] if v.get()) + (1 if enabled else 0)
-            screen_txt = f"Screen {enabled_count}" if enabled else "disabled"
-            screen_fg  = TEXT_DIM if enabled else BORDER
-            tk.Label(row_f, text=screen_txt, bg=row_bg, fg=screen_fg,
-                     font=("Segoe UI", 8), width=9, anchor="center"
-                     ).grid(row=0, column=1, padx=4, pady=6)
-
-            # Page colour badge + description
-            color = self._page_colors.get(name, TEXT) if enabled else TEXT_DIM
-            badge_fg = "#1a1b26" if enabled else BG3
-            info_f = tk.Frame(row_f, bg=row_bg)
-            info_f.grid(row=0, column=2, sticky="ew", padx=4, pady=5)
-            tk.Label(info_f, text=f"  {name}  ",
-                     bg=color, fg=badge_fg,
-                     font=("Segoe UI", 9, "bold"), padx=3, pady=2
-                     ).pack(side="left")
-            tk.Label(info_f, text=f"  {desc.get(name, '')}",
-                     bg=row_bg, fg=screen_fg,
-                     font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
-
-            # ▲ ▼ buttons
-            btn_f = tk.Frame(row_f, bg=row_bg)
-            btn_f.grid(row=0, column=3, padx=(4, 6))
-            tk.Button(btn_f, text="▲", bg=BG3,
-                      fg=TEXT_DIM if idx > 0 else BORDER,
-                      font=("Segoe UI", 7), relief="flat", width=2, pady=1,
-                      state="normal" if idx > 0 else "disabled",
-                      command=lambda i=idx: self._move_page(i, -1)
-                      ).pack(pady=(0, 1))
-            tk.Button(btn_f, text="▼", bg=BG3,
-                      fg=TEXT_DIM if idx < len(self._page_order)-1 else BORDER,
-                      font=("Segoe UI", 7), relief="flat", width=2, pady=1,
-                      state="normal" if idx < len(self._page_order)-1 else "disabled",
-                      command=lambda i=idx: self._move_page(i, 1)
-                      ).pack()
-
-    def _move_page(self, idx, direction):
-        other = idx + direction
-        if 0 <= other < len(self._page_order):
-            self._page_order[idx], self._page_order[other] = self._page_order[other], self._page_order[idx]
-            self._rebuild_order_rows()
-
-    def get_page_order(self):
-        """Return ordered list of enabled page IDs e.g. [2, 1, 0]"""
-        return [pid for pid, _, v in self._page_order if v.get()]
-
-    # ── BRANDING FOOTER ──────────────────────────────────────────────────────
-    def _build_footer(self):
-        footer = tk.Frame(self, bg=BG3, pady=4)
-        footer.pack(fill="x", side="bottom", padx=0)
-
-        # Left: logo text + version
-        left = tk.Frame(footer, bg=BG3)
-        left.pack(side="left", padx=12)
-        tk.Label(left, text="⬡ ROZAKOS INDUSTRIES",
-                 bg=BG3, fg="#9e1a1a",
-                 font=("Segoe UI", 8, "bold")).pack(side="left")
-        tk.Label(left, text=f"  v{APP_VERSION}",
-                 bg=BG3, fg=TEXT_DIM,
-                 font=("Segoe UI", 7)).pack(side="left")
-
-        # Right: website + email
-        right = tk.Frame(footer, bg=BG3)
-        right.pack(side="right", padx=12)
-
-        def link_btn(text, url_or_mail, is_mail=False):
-            import webbrowser
-            lbl = tk.Label(right, text=text, bg=BG3, fg=ACCENT2,
-                           font=("Segoe UI", 8, "underline"), cursor="hand2")
-            lbl.pack(side="right", padx=(8,0))
-            target = ("mailto:" + url_or_mail) if is_mail else url_or_mail
-            lbl.bind("<Button-1>", lambda e: webbrowser.open(target))
-            lbl.bind("<Enter>", lambda e: lbl.config(fg=ACCENT))
-            lbl.bind("<Leave>", lambda e: lbl.config(fg=ACCENT2))
-
-        link_btn(BRAND_EMAIL, BRAND_EMAIL, is_mail=True)
-        tk.Label(right, text="·", bg=BG3, fg=TEXT_DIM,
-                 font=("Segoe UI", 8)).pack(side="right", padx=2)
-        link_btn(BRAND_URL, BRAND_URL)
-
-    # ── LOG PANEL (dashboard right column, bottom) ───────────────────────────
     def _build_log(self, parent):
-        f = tk.LabelFrame(parent, text=" Log ", bg=BG2, fg=ACCENT,
-                          font=("Segoe UI",10,"bold"), bd=0, relief="flat",
-                          highlightbackground=BORDER, highlightthickness=1)
-        f.grid(row=1, column=1, sticky="nsew", pady=(0,6))
-        f.rowconfigure(1, weight=1); f.columnconfigure(0, weight=1)
+        bar = tk.Frame(parent, bg=BG); bar.pack(fill="x", padx=16, pady=(14, 6))
+        self._verbose_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(bar, text="  Show raw serial traffic", variable=self._verbose_var,
+                       command=self._on_verbose, bg=BG, fg=TEXT, selectcolor=BG3,
+                       activebackground=BG, activeforeground=TEXT, font=(UI_FONT, 9),
+                       highlightthickness=0, bd=0, cursor="hand2").pack(side="left")
+        FlatButton(bar, "Clear", self._clear_log, font=(UI_FONT, 8), padx=10, pady=3).pack(side="right")
+        FlatButton(bar, "Copy all", self._copy_log, font=(UI_FONT, 8), padx=10, pady=3).pack(side="right", padx=6)
+        box = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self._log = tk.Text(box, bg=BG2, fg=TEXT, font=(MONO_FONT, 9), insertbackground=TEXT,
+                            relief="flat", state="disabled", wrap="word", padx=10, pady=8,
+                            highlightthickness=0)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self._log.yview)
+        self._log.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y"); self._log.pack(fill="both", expand=True)
+        for tag, col in (("err", RED), ("ok", GREEN), ("info", ACCENT), ("warn", YELLOW),
+                         ("tx", TEXT_DIM), ("ts", BORDER)):
+            self._log.tag_config(tag, foreground=col)
 
-        hdr = tk.Frame(f, bg=BG2); hdr.grid(row=0, column=0, sticky="ew", padx=6, pady=(4,0))
-        tk.Button(hdr, text="Clear", bg=BG3, fg=TEXT_DIM,
-                  font=("Segoe UI",8), relief="flat", padx=8,
-                  command=self._clear_log).pack(side="right")
+    def _on_verbose(self):
+        self._flags["verbose"] = self._verbose_var.get()
+        self._save_settings()
 
-        self._log = scrolledtext.ScrolledText(
-            f, bg=BG, fg=TEXT, font=("Consolas",8),
-            insertbackground=TEXT, relief="flat", state="disabled", wrap="word")
-        self._log.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2,6))
-        self._log.tag_config("err",  foreground=RED)
-        self._log.tag_config("ok",   foreground=GREEN)
-        self._log.tag_config("info", foreground=ACCENT)
-        self._log.tag_config("tx",   foreground=TEXT_DIM)
+    def _copy_log(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._log.get("1.0", "end-1c"))
+        self._log_event("[OK] Log copied to clipboard")
 
     def _clear_log(self):
-        self._log.config(state="normal"); self._log.delete("1.0","end")
+        self._log.config(state="normal"); self._log.delete("1.0", "end")
         self._log.config(state="disabled")
 
-    def _append_log(self, msg):
-        tag = "tx"
+    @staticmethod
+    def _tag_for(msg):
         ml = msg.lower()
-        if "[error]" in ml:  tag = "err"
-        elif "[ok]" in ml:   tag = "ok"
-        elif "[info]" in ml or "[warn]" in ml: tag = "info"
+        if "[error]" in ml: return "err"
+        if "[ok]" in ml: return "ok"
+        if "[warn]" in ml: return "warn"
+        if "[info]" in ml: return "info"
+        return "tx"
+
+    def _append_log(self, msg):
+        tag = self._tag_for(msg)
         self._log.config(state="normal")
-        self._log.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n", tag)
-        self._log.see("end"); self._log.config(state="disabled")
+        at_end = self._log.yview()[1] > 0.999
+        self._log.insert("end", time.strftime("%H:%M:%S  "), "ts")
+        self._log.insert("end", f"{msg}\n", tag)
+        lines = int(self._log.index("end-1c").split(".")[0])
+        if lines > MAX_LOG_LINES:
+            self._log.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
+        if at_end:
+            self._log.see("end")
+        self._log.config(state="disabled")
+        if tag in ("err", "ok", "warn") or msg.startswith("[INFO] IDENT"):
+            self._log_event(msg, log=False)
+
+    def _log_event(self, msg, log=True):
+        """Short, human line in the dashboard's Activity box (and the log)."""
+        if log:
+            self._append_log(msg)
+            return
+        if not hasattr(self, "_activity"):
+            return
+        clean = re.sub(r"^\[(ERROR|OK|WARN|INFO)\]\s*", "", msg).strip().splitlines()[0][:140]
+        if not clean:
+            return
+        self._activity.config(state="normal")
+        self._activity.insert("1.0", f"{time.strftime('%H:%M')}  {clean}\n", self._tag_for(msg))
+        self._activity.delete("40.0", "end")
+        self._activity.config(state="disabled")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  SYSTEM TRAY
     # ══════════════════════════════════════════════════════════════════════════
     def _make_tray_image(self):
-        """Use the Rozakos robot logo as tray icon."""
         try:
             import base64, io
             data = base64.b64decode(_ROBOT_B64)
-            return Image.open(io.BytesIO(data)).convert("RGBA").resize((64,64))
+            return Image.open(io.BytesIO(data)).convert("RGBA").resize((64, 64))
         except Exception:
             img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-            ImageDraw.Draw(img).ellipse([4,4,60,60], fill="#9e1a1a")
+            ImageDraw.Draw(img).ellipse([4, 4, 60, 60], fill="#9e1a1a")
             return img
 
-    # ── SETTINGS PERSISTENCE ─────────────────────────────────────────────────
+    def _on_close(self):
+        """Hide to the tray instead of quitting."""
+        self._save_settings()
+        if TRAY_OK:
+            self.withdraw()
+            self._start_tray()
+        else:
+            self._quit_app()
+
+    def _start_tray(self):
+        if self._tray_icon is not None:
+            return
+        run_text = lambda item: "Stop streaming" if self._running else "Start streaming"
+        menu = pystray.Menu(
+            pystray.MenuItem("Open", self._restore_from_tray, default=True),
+            pystray.MenuItem(run_text, lambda icon, item: self.after(0, self._toggle_run)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._quit_app),
+        )
+        self._tray_icon = pystray.Icon("PCMonitor", self._make_tray_image(), "PC Monitor Sender", menu)
+        self._tray_thread = threading.Thread(target=self._tray_icon.run, daemon=True)
+        self._tray_thread.start()
+
+    def _restore_from_tray(self, icon=None, item=None):
+        if self._tray_icon:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self.after(0, self._do_restore)
+
+    def _do_restore(self):
+        self.deiconify(); self.lift(); self.focus_force()
+
+    def _quit_app(self, icon=None, item=None):
+        self._save_settings()
+        if self._tray_icon:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self._stop_event.set()
+        self.after(0, self.destroy)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SETTINGS
+    # ══════════════════════════════════════════════════════════════════════════
     _PAGE_NAMES = {0: "CPU", 1: "GPU", 2: "RAM", 3: "NET"}
 
     def _collect_settings(self) -> dict:
-        """Snapshot the current UI configuration into a JSON-serialisable dict."""
         return {
             "port":         self._get_selected_port(),
             "default_port": self._default_port,
-            "baud":       self._baud_var.get().strip(),
-            "lhm_path":   self._lhm_var.get().strip(),
-            "lhm_dest":   self._lhm_dest_var.get().strip(),
-            "page_delay": self._delay_var.get(),
-            "page_order": [[pid, bool(v.get())] for pid, _, v in self._page_order],
-            "lcd_types":  dict(self._lcd_types),
+            "baud":         self._baud_var.get().strip(),
+            "lhm_path":     self._lhm_var.get().strip(),
+            "lhm_dest":     self._lhm_dest_var.get().strip(),
+            "page_delay":   self._delay_var.get(),
+            "page_order":   [[pid, bool(v.get())] for pid, _, v in self._page_order],
+            "lcd_types":    dict(self._lcd_types),
             "lhm_prompt_dismissed": getattr(self, "_lhm_prompt_dismissed", False),
+            "auto_reconnect":    self._auto_reconnect_var.get(),
+            "autostart_on_open": self._autostart_var.get(),
+            "verbose_log":       self._verbose_var.get(),
+            "geometry":          self.geometry() if self.state() == "normal" else getattr(self, "_geom", None),
         }
 
     def _save_settings(self):
         try:
+            if not hasattr(self, "_auto_reconnect_var"):
+                return          # UI not built yet
             save_settings(self._collect_settings())
         except Exception:
             pass
 
     def _apply_settings(self, d: dict):
-        """Apply a saved settings dict to the UI widgets."""
         if not d:
             return
         try:
+            if d.get("geometry"):
+                self._geom = d["geometry"]
+                try: self.geometry(d["geometry"])
+                except Exception: pass
             if d.get("default_port"):
                 self._default_port = d["default_port"]
                 self._pin_port_var.set(True)
@@ -2339,15 +2616,15 @@ class App(tk.Tk):
             if d.get("lhm_dest"):
                 self._lhm_dest_var.set(d["lhm_dest"])
             self._lhm_prompt_dismissed = bool(d.get("lhm_prompt_dismissed", False))
+            self._auto_reconnect_var.set(bool(d.get("auto_reconnect", True)))
+            self._autostart_var.set(bool(d.get("autostart_on_open", False)))
+            self._verbose_var.set(bool(d.get("verbose_log", False)))
+            self._flags["verbose"] = self._verbose_var.get()
             if "page_delay" in d:
                 self._delay_var.set(int(d["page_delay"]))
-                self._dlbl.config(text=f"{self._delay_var.get()/1000:.1f} s")
+                self._dlbl.config(text=f"{self._delay_var.get() / 1000:.1f} s")
             if d.get("port"):
-                # _refresh_ports (scheduled shortly after) maps this to a label
-                # and keeps it selected if the device is present.
                 self._port_var.set(d["port"])
-
-            # Page order + enabled flags (preserve saved order)
             po = d.get("page_order")
             if po:
                 rebuilt, seen = [], set()
@@ -2357,51 +2634,33 @@ class App(tk.Tk):
                     except (ValueError, TypeError, IndexError):
                         continue
                     if pid in self._PAGE_NAMES and pid not in seen:
-                        rebuilt.append(
-                            (pid, self._PAGE_NAMES[pid], tk.BooleanVar(value=en)))
+                        rebuilt.append((pid, self._PAGE_NAMES[pid], tk.BooleanVar(value=en)))
                         seen.add(pid)
-                # Keep any pages missing from the saved order (their current vars)
                 for pid, name, var in self._page_order:
                     if pid not in seen:
                         rebuilt.append((pid, name, var))
                 if rebuilt:
                     self._page_order = rebuilt
                     self._rebuild_order_rows()
-
-            # LCD types -- pre-populate rows so types are remembered before connect
             for addr, t in (d.get("lcd_types") or {}).items():
-                self._add_lcd_row(addr)
-                key = addr.upper()
-                if not key.startswith("0X"):
-                    key = "0X" + key
-                if key in self._lcd_type_vars and t in ("1602", "2004"):
-                    self._lcd_type_vars[key].set(t)
+                if t in ("1602", "2004"):
+                    self._lcd_types["0x" + addr.upper()[2:] if addr.upper().startswith("0X") else "0x" + addr.upper()] = t
+                    self._add_lcd_row(addr)
+            self._rebuild_previews()
         except Exception as e:
             self._append_log(f"[WARN] Could not apply saved settings: {e}")
 
-    def _autostart_monitor(self):
-        """Begin monitoring automatically (used for boot launches)."""
-        if not self._running:
-            self._append_log("[INFO] Auto-starting monitor (boot launch)...")
-            self._start()
-
     def _toggle_startup(self):
-        """Enable/disable the logon scheduled task to match the checkbox."""
         want = self._startup_var.get()
         ok, msg = _enable_startup() if want else _disable_startup()
-        self._append_log(msg)
+        self._log_event(msg)
         if not ok:
-            # Revert the checkbox so it reflects the real state.
             self._startup_var.set(not want)
             if not _is_admin():
-                self._append_log(
-                    "[INFO] Administrator rights are required to change "
-                    "start-on-boot.")
+                self._log_event("[WARN] Administrator rights are required to change start-with-Windows.")
 
     def report_callback_exception(self, exc, val, tb):
-        """Tk routes widget-callback errors here. Without an override they'd be
-        printed to stderr -- which is a null sink in this windowed app -- and
-        silently lost. Surface them in the log and persist to crash.log."""
+        """Tk routes widget-callback errors here; surface them and persist to crash.log."""
         import traceback, datetime
         try:
             msg = "".join(traceback.format_exception(exc, val, tb))
@@ -2414,134 +2673,125 @@ class App(tk.Tk):
         try:
             _ensure_data_dir()
             with open(os.path.join(_DATA_DIR, "crash.log"), "a", encoding="utf-8") as f:
-                f.write(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
-                        "(GUI callback) =====\n")
+                f.write(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (GUI callback) =====\n")
                 f.write(msg)
         except Exception:
             pass
 
-    def _on_close(self):
-        """Minimise to tray instead of quitting."""
-        self._save_settings()
-        if TRAY_OK:
-            self.withdraw()   # hide window + taskbar entry
-            self._start_tray()
-        else:
-            self._quit_app()
-
-    def _start_tray(self):
-        if self._tray_icon is not None:
-            return
-        menu = pystray.Menu(
-            pystray.MenuItem("Restore", self._restore_from_tray, default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",    self._quit_app),
-        )
-        self._tray_icon = pystray.Icon(
-            "PCMonitor", self._make_tray_image(),
-            "PC Monitor Sender", menu)
-        import threading
-        self._tray_thread = threading.Thread(
-            target=self._tray_icon.run, daemon=True)
-        self._tray_thread.start()
-
-    def _restore_from_tray(self, icon=None, item=None):
-        if self._tray_icon:
-            self._tray_icon.stop()
-            self._tray_icon = None
-        self.after(0, self._do_restore)
-
-    def _do_restore(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-
-    def _quit_app(self, icon=None, item=None):
-        self._save_settings()
-        if self._tray_icon:
-            self._tray_icon.stop()
-            self._tray_icon = None
-        self._stop_event.set()
-        self.after(0, self.destroy)
-
     # ══════════════════════════════════════════════════════════════════════════
     #  START / STOP / POLL
     # ══════════════════════════════════════════════════════════════════════════
-    def _start(self):
-        if self._running: return
-        self._save_settings()   # remember this configuration for next launch
-        self._stop_event.clear()
-        cfg = {
+    def _autostart_monitor(self):
+        if not self._running:
+            self._append_log("[INFO] Auto-starting monitor...")
+            self._start()
+
+    def _toggle_run(self):
+        if self._running:
+            self._stop()
+        elif self._state != "stopping":
+            self._start()
+
+    def _run_cfg(self):
+        return {
             "port":       self._get_selected_port(),
             "baud":       int(self._baud_var.get().strip()),
             "lhm_path":   self._lhm_var.get().strip(),
             "page_delay": self._delay_var.get(),
             "lcd_types":  dict(self._lcd_types),
             "page_order": self.get_page_order(),
+            "auto_reconnect": self._auto_reconnect_var.get(),
         }
-        self._thread = MonitorThread(cfg, self._log_q, self._stats_q,
-                                     self._lcd_q, self._stop_event)
+
+    def _start(self):
+        if self._running:
+            return
+        try:
+            cfg = self._run_cfg()
+        except ValueError:
+            self._log_event(f"[ERROR] Baud rate must be a number, got '{self._baud_var.get()}'")
+            self._nb.select(2); return
+        if not cfg["port"]:
+            self._log_event("[ERROR] Pick the board's COM port first (Connection tab)")
+            self._nb.select(2); return
+        self._save_settings()
+        self._stop_event = threading.Event()
+        self._thread = MonitorThread(cfg, self._log_q, self._stats_q, self._lcd_q,
+                                     self._stop_event, self._status_q, self._flags)
         self._thread.start()
         self._running = True
-        self._start_btn.config(state="disabled", bg=BG3, fg=TEXT_DIM)
-        self._stop_btn.config(state="normal",    bg=RED, fg="#1a1b26")
-        self._status_dot.config(fg=GREEN)
-        self._status_lbl.config(text="Running", fg=GREEN)
+        self._set_state("connecting", cfg["port"])
 
     def _stop(self):
-        if not self._running: return
-        self._stop_event.set(); self._running = False
-        self._start_btn.config(state="normal",  bg=GREEN,    fg="#1a1b26")
-        self._stop_btn.config(state="disabled", bg=BG3,      fg=TEXT_DIM)
-        self._status_dot.config(fg=TEXT_DIM)
-        self._status_lbl.config(text="Stopped", fg=TEXT_DIM)
+        if not self._running:
+            return
+        self._stop_event.set()
+        self._running = False
+        self._set_state("stopping")
+
+    def _set_state(self, state, detail=""):
+        self._state = state
+        text, color = _STATUS_LOOK.get(state, (state, TEXT_DIM))
+        if detail and state in ("connecting", "waiting", "running"):
+            text = f"{text}  {detail}"
+        self._status_dot.config(fg=color)
+        self._status_lbl.config(text=text)
+        if state == "stopping":
+            self._run_btn.style(text="Stopping…", bg=BG3, fg=TEXT_DIM, enabled=False)
+        elif self._running:
+            self._run_btn.style(text="■  Stop", bg=RED, fg=BG, hover=_blend(RED, "#ffffff", 0.8), enabled=True)
+        else:
+            self._run_btn.style(text="▶  Start", bg=GREEN, fg=BG, hover=_blend(GREEN, "#ffffff", 0.8), enabled=True)
+        sub = {"running": "Sending stats to your screens",
+               "reconnecting": "Board unplugged? Waiting for it to come back",
+               "error": "Something went wrong, see the Log tab"}.get(state, "Live PC stats on your LCD screens")
+        self._subtitle.config(text=sub)
+        try:
+            if self._tray_icon is not None:
+                self._tray_icon.update_menu()
+        except Exception:
+            pass
 
     def _poll(self):
-        # Drain log
         try:
-            while True: self._append_log(self._log_q.get_nowait())
-        except queue.Empty: pass
-
-        # Drain discovered LCD addresses
+            for _ in range(200):
+                self._append_log(self._log_q.get_nowait())
+        except queue.Empty:
+            pass
         try:
             while True:
-                addr = self._lcd_q.get_nowait()
-                self._add_lcd_row(addr)
-        except queue.Empty: pass
-
-        # Drain stats
+                self._add_lcd_row(self._lcd_q.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                state, detail = self._status_q.get_nowait()
+                if state in ("stopped", "error"):
+                    self._running = False
+                if self._state == "stopping" and state not in ("stopped", "error"):
+                    continue          # ignore late updates from a thread we stopped
+                self._set_state(state, detail)
+        except queue.Empty:
+            pass
         latest = None
         try:
-            while True: latest = self._stats_q.get_nowait()
-        except queue.Empty: pass
+            while True:
+                latest = self._stats_q.get_nowait()
+        except queue.Empty:
+            pass
         if latest:
-            self._latest_stats.update(latest)
+            first = not self._latest_stats
+            self._latest_stats = latest
             self._update_dashboard(latest)
-
-        if self._running and self._thread and not self._thread.is_alive():
-            self._stop()
-
-        self.after(500, self._poll)
-
-    def _update_dashboard(self, s):
-        self._bar_cpu.set(s["cpu"],  f"{s['cpu']:5.1f}%"); self._cpu_temp.set(s["cpu_temp"])
-        self._bar_gpu.set(s["gpu"],  f"{s['gpu']:5.1f}%"); self._gpu_temp.set(s["gpu_temp"])
-        vm = s["vram_mb"]; vt = s.get("vram_total_mb", -1)
-        if vm >= 0 and vt > 0:
-            self._vram.config(text=f" {vm} / {vt} MB")
-        elif vm >= 0:
-            self._vram.config(text=f" {vm} MB")
-        else:
-            self._vram.config(text="")
-        self._bar_ram.set(s["ram"],  f"{s['ram']:5.1f}%")
-        self._ram_used.config(text=f" {s['ram_mb']} / {int(s['ram_total_mb'])} MB")
-        ls_kb = s["link_speed"] * 1000 / 8
-        def fmt_speed(kb):
-            if kb >= 1024: return f"{kb/1024:>5.1f} MB/s"
-            return       f"{kb:>5.0f} KB/s"
-        self._bar_dl.set(min(100, s["dl_kb"]/ls_kb*100) if ls_kb else 0, fmt_speed(s["dl_kb"]))
-        self._bar_ul.set(min(100, s["ul_kb"]/ls_kb*100) if ls_kb else 0, fmt_speed(s["ul_kb"]))
-        self._link.config(text=f" {s['link_speed']} Mbps")
+            self._render_previews()      # live values; the page rotation ticks separately
+            if first:
+                self._preview_step = 0
+        if self._thread is not None and not self._thread.is_alive() and self._state not in ("stopped", "error"):
+            self._running = False
+            self._set_state("stopped")
+        if self.state() == "normal":
+            self._geom = self.geometry()
+        self.after(250, self._poll)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
